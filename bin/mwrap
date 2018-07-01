@@ -1,0 +1,17 @@
+#!/usr/bin/ruby
+# frozen_string_literal: true
+require 'mwrap'
+mwrap_so = $".grep(%r{/mwrap\.so\z})[0] or abort "mwrap.so not loaded"
+cur = ENV['LD_PRELOAD']
+ENV['LD_PRELOAD'] = cur ? "#{mwrap_so}:#{cur}" : mwrap_so
+
+# work around close-on-exec by default behavior in Ruby:
+opts = {}
+if ENV['MWRAP'] =~ /dump_fd:(\d+)/
+  dump_fd = $1.to_i
+  if dump_fd > 2
+    dump_io = IO.new(dump_fd)
+    opts[dump_fd] = dump_io
+  end
+end
+exec *ARGV, opts

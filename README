@@ -1,0 +1,58 @@
+= mwrap - LD_PRELOAD malloc wrapper + line stats for Ruby
+
+Wraps all malloc, calloc, and realloc calls to trace the Ruby source
+location of such calls and bytes allocated at each callsite.  This
+functionality may change incompatibly or be expanded in the future.
+
+This is useful for finding malloc hotspots in Ruby code.  It does
+not track allocation lifetimes, or frees, however.
+
+Only supports Ruby trunk (2.6.0dev+) a few platforms:
+
+* GNU/Linux
+* FreeBSD 11
+
+== Usage
+
+It works as an LD_PRELOAD and supplies a mwrap RubyGem executable to
+improve ease-of-use.  You can set dump_fd: in the MWRAP environment
+variable to dump the results to a certain file descriptor at exit:
+
+	MWRAP=dump_fd:2 mwrap RUBY_COMMAND
+
+You may also set dump_path to append to a log file:
+
+	MWRAP=dump_path:/path/to/log mwrap RUBY_COMMAND
+
+You may also `require 'mwrap'' in your Ruby code and use
+Mwrap.dump and Mwrap.clear.
+
+== Known problems
+
+* 32-bit machines are prone to overflow (WONTFIX)
+
+* Allocations outside of GVL are not tracked (TODO)
+
+== Mail archives and list:
+
+	https://80x24.org/mwrap-public/
+	nntp://80x24.org/inbox.comp.lang.ruby.mwrap
+
+No subscription will ever be required to post, but HTML mail
+will be rejected:
+
+		mwrap-public@80x24.org
+
+== Hacking
+
+	git clone https://80x24.org/mwrap.git
+
+Send all patches and pull requests (use "git request-pull" to format) to
+the mailing list.  We do not use centralized or proprietary messaging
+systems.
+
+== License
+
+GPL-2.0+ <https://www.gnu.org/licenses/gpl-2.0.txt>
+
+Note: we may depend on 3rd-party LGPL/GPL libraries in future releases
