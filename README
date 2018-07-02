@@ -36,17 +36,15 @@ It may work on NetBSD, OpenBSD and DragonFly BSD.
 == Usage
 
 mwrap works as an LD_PRELOAD and supplies a mwrap RubyGem executable to
-improve ease-of-use.  You can set dump_fd: in the MWRAP environment
-variable to dump the results to a certain file descriptor at exit:
-
-	# Dump results to stderr at exit:
-	MWRAP=dump_fd:2 mwrap RUBY_COMMAND
-
-You may also set dump_path to append to a log file:
+improve ease-of-use.  You can set dump_path: in the MWRAP environment
+variable to append the results to a log file:
 
 	MWRAP=dump_path:/path/to/log mwrap RUBY_COMMAND
 
-You may also `require 'mwrap'' in your Ruby code and use
+	# And to display the locations with the most allocations:
+	sort -k1,1rn </path/to/log | $PAGER
+
+You may also `require "mwrap"' in your Ruby code and use
 Mwrap.dump, Mwrap.clear, Mwrap.reset, Mwrap.each, etc.
 
 However, mwrap MUST be loaded via LD_PRELOAD to have any
@@ -57,7 +55,9 @@ The output of the mwrap dump is a text file with 3 columns:
 	total_bytes	call_count	location
 
 Where location is a Ruby source location (if made under GVL)
-or an address retrieved by backtrace_symbols(3)
+or an address retrieved by backtrace_symbols(3).  It is
+recommended to use the sort(1) command on either of the
+first two columns to find the hottest malloc locations.
 
 == Known problems
 
