@@ -1,9 +1,21 @@
 #!/usr/bin/ruby
 # frozen_string_literal: true
+# Copyright (C) 2018 mwrap hackers <mwrap-public@80x24.org>
+# License: GPL-2.0+ <https://www.gnu.org/licenses/gpl-2.0.txt>
 require 'mwrap'
 mwrap_so = $".grep(%r{/mwrap\.so\z})[0] or abort "mwrap.so not loaded"
 cur = ENV['LD_PRELOAD']
-ENV['LD_PRELOAD'] = cur ? "#{mwrap_so}:#{cur}" : mwrap_so
+if cur
+  cur = cur.split(/[:\s]+/)
+  if !cur.include?(mwrap_so)
+    # drop old versions
+    cur.delete_if { |path| path.end_with?('/mwrap.so') }
+    cur.unshift(mwrap_so)
+    ENV['LD_PRELOAD'] = cur.join(':')
+  end
+else
+  ENV['LD_PRELOAD'] = mwrap_so
+end
 
 # work around close-on-exec by default behavior in Ruby:
 opts = {}
