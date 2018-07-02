@@ -323,6 +323,19 @@ out_unlock:
 	return 0;
 }
 
+/*
+ * call-seq:
+ *
+ *	Mwrap.dump([[io] [, min]] -> nil
+ *
+ * Dumps the current totals to +io+ which must be an IO object
+ * (StringIO and similar are not supported).  Total sizes smaller
+ * than or equal to +min+ are skipped.
+ *
+ * The output is space-delimited by 3 columns:
+ *
+ * total_size      call_count      location
+ */
 static VALUE mwrap_dump(int argc, VALUE * argv, VALUE mod)
 {
 	VALUE io, min;
@@ -373,6 +386,15 @@ static void *totals_clear(void *ign)
 	return 0;
 }
 
+/*
+ * call-seq:
+ *
+ *	Mwrap.clear -> nil
+ *
+ * Atomically replaces the totals table and destroys the old one.
+ * This resets all statistics. It is more expensive than `Mwrap.reset'
+ * as new allocations will need to be made to repopulate the new table.
+ */
 static VALUE mwrap_clear(VALUE mod)
 {
 	rb_thread_call_without_gvl(totals_clear, 0, 0, 0);
@@ -395,6 +417,15 @@ static void *totals_reset(void *ign)
 	return 0;
 }
 
+/*
+ * call-seq:
+ *
+ *	Mwrap.reset -> nil
+ *
+ * Resets the the total tables by zero-ing all counters.
+ * This resets all statistics and is less costly than `Mwrap.clear'
+ * but is not an atomic operation.
+ */
 static VALUE mwrap_reset(VALUE mod)
 {
 	rb_thread_call_without_gvl(totals_reset, 0, 0, 0);
@@ -443,6 +474,15 @@ static VALUE dump_each_rcu(VALUE x)
 	return Qnil;
 }
 
+/*
+ * call-seq:
+ *
+ * 	Mwrap.each([min]) { |location,total_bytes,call_count| ... }
+ *
+ * Yields each entry of the of the table to a caller-supplied block.
+ * +min+ may be specified to filter out lines with +total_bytes+
+ * equal-to-or-smaller-than the supplied minimum.
+ */
 static VALUE mwrap_each(int argc, VALUE * argv, VALUE mod)
 {
 	VALUE min;
@@ -457,6 +497,28 @@ static VALUE mwrap_each(int argc, VALUE * argv, VALUE mod)
 	return rb_ensure(dump_each_rcu, (VALUE)&a, dump_ensure, 0);
 }
 
+/*
+ * Document-module: Mwrap
+ *
+ *   require 'mwrap'
+ *
+ * Mwrap has a dual function as both a Ruby C extension and LD_PRELOAD
+ * wrapper.  As a Ruby C extension, it exposes a limited Ruby API.
+ * To be effective at gathering status, mwrap must be loaded as a
+ * LD_PRELOAD (using the mwrap(1) executable makes it easy)
+ *
+ * ENVIRONMENT
+ *
+ * The "MWRAP" environment variable contains a comma-delimited list
+ * of key:value options for automatically dumping at program exit.
+ *
+ * * dump_fd: a writable FD to dump to
+ * * dump_path: a path to dump to, the file is opened in O_APPEND mode
+ * * dump_min: the minimum allocation size (total) to dump
+ *
+ * If both `dump_fd' and `dump_path' are specified, dump_path takes
+ * precedence.
+ */
 void Init_mwrap(void)
 {
 	VALUE mod = rb_define_module("Mwrap");

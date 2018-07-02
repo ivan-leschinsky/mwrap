@@ -3,3 +3,4 @@
 *.so
 /pkg
 /*.gem
+/doc
