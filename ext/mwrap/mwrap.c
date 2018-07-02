@@ -154,11 +154,21 @@ struct src_loc {
 	size_t total;
 	struct cds_lfht_node hnode;
 	uint32_t hval;
-	uint32_t kcapa;
+	uint32_t capa;
 	char k[];
 };
 
-static inline int loc_eq(struct cds_lfht_node *node, const void *key)
+static int loc_is_addr(const struct src_loc *l)
+{
+	return l->capa == 0;
+}
+
+static size_t loc_size(const struct src_loc *l)
+{
+	return loc_is_addr(l) ? sizeof(uintptr_t) : l->capa;
+}
+
+static int loc_eq(struct cds_lfht_node *node, const void *key)
 {
 	const struct src_loc *existing;
 	const struct src_loc *k = key;
@@ -166,9 +176,8 @@ static inline int loc_eq(struct cds_lfht_node *node, const void *key)
 	existing = caa_container_of(node, struct src_loc, hnode);
 
 	return (k->hval == existing->hval &&
-		k->kcapa == existing->kcapa &&
-		memcmp(k->k, existing->k, k->kcapa == UINT32_MAX ?
-		       sizeof(uintptr_t) : k->kcapa) == 0);
+		k->capa == existing->capa &&
+		memcmp(k->k, existing->k, loc_size(k)) == 0);
 }
 
 static void totals_add(struct src_loc *k)
@@ -190,7 +199,7 @@ again:
 		uatomic_add(&l->total, k->total);
 		uatomic_add(&l->calls, 1);
 	} else {
-		size_t n = k->kcapa == UINT32_MAX ? sizeof(uintptr_t) : k->kcapa;
+		size_t n = loc_size(k);
 		l = malloc(sizeof(*l) + n);
 		if (!l) goto out_unlock;
 
@@ -232,8 +241,8 @@ static void update_stats(size_t size, uintptr_t caller)
 		dst = int2str(line, dst, &int_size);
 		if (dst) {
 			*dst = 0;	/* terminate string */
-			k->kcapa = (uint32_t)(dst - k->k + 1);
-			k->hval = jhash(k->k, k->kcapa, 0xdeadbeef);
+			k->capa = (uint32_t)(dst - k->k + 1);
+			k->hval = jhash(k->k, k->capa, 0xdeadbeef);
 			totals_add(k);
 		} else {
 			rb_bug("bad math making key from location %s:%d\n",
@@ -244,7 +253,7 @@ unknown:
 		k = alloca(sizeof(*k) + xlen);
 		k->total = size;
 		memcpy(k->k, &caller, xlen);
-		k->kcapa = UINT32_MAX;
+		k->capa = 0;
 		k->hval = jhash(k->k, xlen, 0xdeadbeef);
 		totals_add(k);
 	}
@@ -297,7 +306,7 @@ static void dump_to_file(struct dump_arg *a)
 			char **s = 0;
 			if (l->total <= a->min) continue;
 
-			if (l->kcapa == UINT32_MAX) {
+			if (loc_is_addr(l)) {
 				s = backtrace_symbols(p, 1);
 				p = s[0];
 			}
@@ -399,13 +408,13 @@ static VALUE dump_each_rcu(VALUE x)
 			VALUE v[3];
 			if (l->total <= a->min) continue;
 
-			if (l->kcapa == UINT32_MAX) {
+			if (loc_is_addr(l)) {
 				char **s = backtrace_symbols((void *)l->k, 1);
 				v[1] = rb_str_new_cstr(s[0]);
 				free(s);
 			}
 			else {
-				v[1] = rb_str_new(l->k, l->kcapa - 1);
+				v[1] = rb_str_new(l->k, l->capa - 1);
 			}
 			v[0] = rb_funcall(v[1], id_uminus, 0);
 
