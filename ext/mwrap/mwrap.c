@@ -292,30 +292,35 @@ struct dump_arg {
 	size_t min;
 };
 
-static void dump_to_file(struct dump_arg *a)
+static void *dump_to_file(void *x)
 {
+	struct dump_arg *a = x;
 	struct cds_lfht_iter iter;
 	struct src_loc *l;
 	struct cds_lfht *t;
 
+	++locating;
 	rcu_read_lock();
 	t = rcu_dereference(totals);
-	if (t) {
-		cds_lfht_for_each_entry(t, &iter, l, hnode) {
-			const void *p = l->k;
-			char **s = 0;
-			if (l->total <= a->min) continue;
+	if (!t)
+		goto out_unlock;
+	cds_lfht_for_each_entry(t, &iter, l, hnode) {
+		const void *p = l->k;
+		char **s = 0;
+		if (l->total <= a->min) continue;
 
-			if (loc_is_addr(l)) {
-				s = backtrace_symbols(p, 1);
-				p = s[0];
-			}
-			fprintf(a->fp, "%16zu %12zu %s\n",
-				l->total, l->calls, (const char *)p);
-			if (s) free(s);
+		if (loc_is_addr(l)) {
+			s = backtrace_symbols(p, 1);
+			p = s[0];
 		}
+		fprintf(a->fp, "%16zu %12zu %s\n",
+			l->total, l->calls, (const char *)p);
+		if (s) free(s);
 	}
+out_unlock:
 	rcu_read_unlock();
+	--locating;
+	return 0;
 }
 
 static VALUE mwrap_dump(int argc, VALUE * argv, VALUE mod)
@@ -335,9 +340,8 @@ static VALUE mwrap_dump(int argc, VALUE * argv, VALUE mod)
 	GetOpenFile(io, fptr);
 	a.fp = rb_io_stdio_file(fptr);
 
-	++locating;
-	dump_to_file(&a);
-	--locating;
+	rb_thread_call_without_gvl(dump_to_file, &a, 0, 0);
+	RB_GC_GUARD(io);
 	return Qnil;
 }
 
@@ -348,7 +352,7 @@ free_src_loc(struct rcu_head *head)
 	free(l);
 }
 
-static VALUE mwrap_clear(VALUE mod)
+static void *totals_clear(void *ign)
 {
 	struct cds_lfht *new, *old;
 	struct cds_lfht_iter iter;
@@ -365,13 +369,17 @@ static VALUE mwrap_clear(VALUE mod)
 	rcu_read_unlock();
 
 	synchronize_rcu(); /* ensure totals points to new */
-
 	cds_lfht_destroy(old, NULL);
+	return 0;
+}
 
+static VALUE mwrap_clear(VALUE mod)
+{
+	rb_thread_call_without_gvl(totals_clear, 0, 0, 0);
 	return Qnil;
 }
 
-static VALUE mwrap_reset(VALUE mod)
+static void *totals_reset(void *ign)
 {
 	struct cds_lfht *t;
 	struct cds_lfht_iter iter;
@@ -384,7 +392,12 @@ static VALUE mwrap_reset(VALUE mod)
 		uatomic_set(&l->calls, 0);
 	}
 	rcu_read_unlock();
+	return 0;
+}
 
+static VALUE mwrap_reset(VALUE mod)
+{
+	rb_thread_call_without_gvl(totals_reset, 0, 0, 0);
 	return Qnil;
 }
 
@@ -403,30 +416,29 @@ static VALUE dump_each_rcu(VALUE x)
 	struct src_loc *l;
 
 	t = rcu_dereference(totals);
-	if (t) {
-		cds_lfht_for_each_entry(t, &iter, l, hnode) {
-			VALUE v[3];
-			if (l->total <= a->min) continue;
+	cds_lfht_for_each_entry(t, &iter, l, hnode) {
+		VALUE v[3];
+		if (l->total <= a->min) continue;
 
-			if (loc_is_addr(l)) {
-				char **s = backtrace_symbols((void *)l->k, 1);
-				v[1] = rb_str_new_cstr(s[0]);
-				free(s);
-			}
-			else {
-				v[1] = rb_str_new(l->k, l->capa - 1);
-			}
-			v[0] = rb_funcall(v[1], id_uminus, 0);
-
-			if (!OBJ_FROZEN_RAW(v[1]))
-				rb_str_resize(v[1], 0);
-
-			v[1] = SIZET2NUM(l->total);
-			v[2] = SIZET2NUM(l->calls);
-
-			rb_yield_values2(3, v);
-			assert(rcu_read_ongoing());
+		if (loc_is_addr(l)) {
+			char **s = backtrace_symbols((void *)l->k, 1);
+			v[1] = rb_str_new_cstr(s[0]);
+			free(s);
 		}
+		else {
+			v[1] = rb_str_new(l->k, l->capa - 1);
+		}
+
+		/* deduplicate and try to free up some memory */
+		v[0] = rb_funcall(v[1], id_uminus, 0);
+		if (!OBJ_FROZEN_RAW(v[1]))
+			rb_str_resize(v[1], 0);
+
+		v[1] = SIZET2NUM(l->total);
+		v[2] = SIZET2NUM(l->calls);
+
+		rb_yield_values2(3, v);
+		assert(rcu_read_ongoing());
 	}
 	return Qnil;
 }
