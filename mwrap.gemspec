@@ -10,15 +10,16 @@ end
 
 Gem::Specification.new do |s|
   s.name = 'mwrap'
-  s.version = '0.0.0'
-  s.homepage = 'https://80x24.org/mwrap.git'
+  s.version = '1.0.0'
+  s.homepage = 'https://80x24.org/mwrap/'
   s.authors = ["Ruby hackers"]
   s.summary = 'LD_PRELOAD malloc wrapper for Ruby'
   s.executables = %w(mwrap)
   s.files = manifest
   s.description = <<~EOF
+mwrap wraps all malloc, calloc, and realloc calls to trace the Ruby
+source location of such calls and bytes allocated at each callsite.
   EOF
-
   s.email = %q{e@80x24.org}
   s.test_files = Dir['test/test_*.rb']
   s.extensions = %w(ext/mwrap/extconf.rb)
