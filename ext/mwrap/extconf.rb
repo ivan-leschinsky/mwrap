@@ -4,10 +4,10 @@
 require 'mkmf'
 
 have_func 'mempcpy'
-if RUBY_PLATFORM =~ /linux/ # should detect glibc
-  if File.read("/proc/#$$/maps") =~ /\blibjemalloc\./
-    $defs << '-DRUBY_USES_JEMALLOC'
-  end
-end
+have_library 'urcu-cds' or abort 'userspace RCU not installed'
+have_header 'urcu/rculfhash.h' or abort 'rculfhash.h not found'
+have_library 'urcu-bp' or abort 'liburcu-bp not found'
 have_library 'dl'
+have_library 'c'
+have_library 'execinfo' # FreeBSD
 create_makefile 'mwrap'

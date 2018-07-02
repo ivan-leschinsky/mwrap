@@ -42,7 +42,7 @@ class TestMwrap < Test::Unit::TestCase
       res = system(env, *cmd, { 5 => tmp })
       assert res, $?.inspect
       tmp.rewind
-      assert_match(/\b10001\s+-e:1$/, tmp.read)
+      assert_match(/\b10001\s+1\s+-e:1$/, tmp.read)
 
       env['MWRAP'] = 'dump_fd:1,dump_min:10000'
       tmp.rewind
@@ -50,14 +50,14 @@ class TestMwrap < Test::Unit::TestCase
       res = system(env, *cmd, { 1 => tmp })
       assert res, $?.inspect
       tmp.rewind
-      assert_match(/\b10001\s+-e:1$/, tmp.read)
+      assert_match(/\b10001\s+1\s+-e:1$/, tmp.read)
 
       tmp.rewind
       tmp.truncate(0)
       env['MWRAP'] = "dump_path:#{tmp.path},dump_min:10000"
       res = system(env, *cmd)
       assert res, $?.inspect
-      assert_match(/\b10001\s+-e:1$/, tmp.read)
+      assert_match(/\b10001\s+1\s+-e:1$/, tmp.read)
     end
   end
 
@@ -75,7 +75,7 @@ class TestMwrap < Test::Unit::TestCase
       tmp.rewind
       buf = tmp.read
       assert_not_match(/\s+-e:1$/, buf)
-      assert_match(/\b20001\s+-e:3$/, buf)
+      assert_match(/\b20001\s+1\s+-e:3$/, buf)
     end
   end
 
@@ -90,9 +90,60 @@ class TestMwrap < Test::Unit::TestCase
         res = system(env, *cmd, out: w)
         w.close
         assert res, $?.inspect
-        assert_match(/unknown/, tmp.read)
+        assert_match(/0x[a-f0-9]+\b/, tmp.read)
       end
       assert_equal "HELLO_WORLD", th.value
+    end
+  end
+
+  # some URCU flavors use USR1, ensure the one we choose does not
+  def test_sigusr1_works
+    cmd = @@cmd + %w(
+      -e STDOUT.sync=true
+      -e trap(:USR1){p("HELLO_WORLD")}
+      -e END{Mwrap.dump}
+      -e puts -e STDIN.read)
+    IO.pipe do |r, w|
+      IO.pipe do |r2, w2|
+        pid = spawn(@@env, *cmd, in: r2, out: w, err: '/dev/null')
+        r2.close
+        w.close
+        assert_equal "\n", r.gets
+        buf = +''
+        10.times { Process.kill(:USR1, pid) }
+        while IO.select([r], nil, nil, 0.1)
+          case tmp = r.read_nonblock(1000, exception: false)
+          when String
+            buf << tmp
+          end
+        end
+        w2.close
+        Process.wait(pid)
+        assert_predicate $?, :success?, $?.inspect
+        assert_equal(["\"HELLO_WORLD\"\n"], buf.split(/^/).uniq)
+      end
+    end
+  end
+
+  def test_reset
+    assert_nil Mwrap.reset
+  end
+
+  def test_each
+    cmd = @@cmd + %w(
+      -e ("0"*10000).clear
+      -e h={}
+      -e Mwrap.each(1000){|a,b,c|h[a]=[b,c]}
+      -e puts(Marshal.dump(h))
+    )
+    r = IO.popen(@@env, cmd, 'r')
+    h = Marshal.load(r.read)
+    assert_not_predicate h, :empty?
+    h.each_key { |k| assert_kind_of String, k }
+    h.each_value do |total,calls|
+      assert_operator total, :>, 0
+      assert_operator calls, :>, 0
+      assert_operator total, :>=, calls
     end
   end
 end
