@@ -22,7 +22,14 @@
 
 static ID id_uminus;
 const char *rb_source_location_cstr(int *line); /* requires 2.6.0dev */
-static int *(*has_gvl_p)(void);
+extern int __attribute__((weak)) ruby_thread_has_gvl_p(void);
+extern void * __attribute__((weak)) ruby_current_execution_context_ptr;
+
+int __attribute__((weak)) ruby_thread_has_gvl_p(void)
+{
+	return 0;
+}
+
 #ifdef __FreeBSD__
 void *__malloc(size_t);
 void *__calloc(size_t, size_t);
@@ -50,13 +57,6 @@ static void *(*real_realloc)(void *, size_t);
 } while (0)
 
 #endif /* !FreeBSD */
-
-/*
- * rb_source_location_cstr relies on GET_EC(), and it's possible
- * to have a native thread but no EC during the early and late
- * (teardown) phases of the Ruby process
- */
-static void **ec_loc;
 
 static struct cds_lfht *totals;
 
@@ -91,14 +91,6 @@ __attribute__((constructor)) static void resolve_malloc(void)
 				call_rcu_after_fork_child);
 	if (err)
 		fprintf(stderr, "pthread_atfork failed: %s\n", strerror(err));
-
-	has_gvl_p = dlsym(RTLD_DEFAULT, "ruby_thread_has_gvl_p");
-
-	/*
-	 * resolve dynamically so it doesn't break when LD_PRELOAD-ed
-	 * into non-Ruby binaries
-	 */
-	ec_loc = dlsym(RTLD_DEFAULT, "ruby_current_execution_context_ptr");
 }
 
 #ifndef HAVE_MEMPCPY
@@ -143,9 +135,14 @@ static char *int2str(int num, char *dst, size_t * size)
 	return NULL;
 }
 
+/*
+ * rb_source_location_cstr relies on GET_EC(), and it's possible
+ * to have a native thread but no EC during the early and late
+ * (teardown) phases of the Ruby process
+ */
 static int has_ec_p(void)
 {
-	return (ec_loc && *ec_loc);
+	return (ruby_thread_has_gvl_p() && ruby_current_execution_context_ptr);
 }
 
 struct src_loc {
@@ -224,7 +221,7 @@ static void update_stats(size_t size, uintptr_t caller)
 
 	if (locating++) goto out; /* do not recurse into another *alloc */
 
-	if (has_gvl_p && has_gvl_p() && has_ec_p()) {
+	if (has_ec_p()) {
 		int line;
 		const char *ptr = rb_source_location_cstr(&line);
 		size_t len;
