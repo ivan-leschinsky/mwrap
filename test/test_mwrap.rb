@@ -146,4 +146,13 @@ class TestMwrap < Test::Unit::TestCase
       assert_operator total, :>=, calls
     end
   end
+
+  def test_benchmark
+    cmd = @@cmd + %w(-rbenchmark
+      -e puts(Benchmark.measure{1000000.times{Time.now}}))
+    r = IO.popen(@@env, cmd, 'r')
+    require 'benchmark'
+    warn Benchmark::Tms::CAPTION
+    warn r.read
+  end if ENV['BENCHMARK']
 end
