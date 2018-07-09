@@ -16,14 +16,21 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <urcu-bp.h>
 #include <urcu/rculfhash.h>
+#include <urcu/rculist.h>
 #include "jhash.h"
 
 static ID id_uminus;
 const char *rb_source_location_cstr(int *line); /* requires 2.6.0dev */
 extern int __attribute__((weak)) ruby_thread_has_gvl_p(void);
 extern void * __attribute__((weak)) ruby_current_execution_context_ptr;
+extern void * __attribute__((weak)) ruby_current_vm_ptr; /* for rb_gc_count */
+extern size_t __attribute__((weak)) rb_gc_count(void);
+
+/* true for glibc/dlmalloc/ptmalloc, not sure about jemalloc */
+#define ASSUMED_MALLOC_ALIGNMENT (sizeof(void *) * 2)
 
 int __attribute__((weak)) ruby_thread_has_gvl_p(void)
 {
@@ -32,17 +39,17 @@ int __attribute__((weak)) ruby_thread_has_gvl_p(void)
 
 #ifdef __FreeBSD__
 void *__malloc(size_t);
-void *__calloc(size_t, size_t);
-void *__realloc(void *, size_t);
+void *__memalign(size_t, size_t);
+void __free(void *);
 static void *(*real_malloc)(size_t) = __malloc;
-static void *(*real_calloc)(size_t, size_t) = __calloc;
-static void *(*real_realloc)(void *, size_t) = __realloc;
+static void *(*real_memalign)(size_t, size_t) = __aligned_alloc;
+static void (*real_free)(void *) = __free;
 #  define RETURN_IF_NOT_READY() do {} while (0) /* nothing */
 #else
 static int ready;
 static void *(*real_malloc)(size_t);
-static void *(*real_calloc)(size_t, size_t);
-static void *(*real_realloc)(void *, size_t);
+static void *(*real_memalign)(size_t, size_t);
+static void (*real_free)(void *);
 
 /*
  * we need to fake an OOM condition while dlsym is running,
@@ -58,7 +65,26 @@ static void *(*real_realloc)(void *, size_t);
 
 #endif /* !FreeBSD */
 
+static size_t generation;
+static size_t page_size;
 static struct cds_lfht *totals;
+union padded_mutex {
+	pthread_mutex_t mtx;
+	char pad[64];
+};
+
+/* a round-robin pool of mutexes */
+#define MUTEX_NR   (1 << 6)
+#define MUTEX_MASK (MUTEX_NR - 1)
+static size_t mutex_i;
+static union padded_mutex mutexes[MUTEX_NR] = {
+	[0 ... (MUTEX_NR-1)].mtx = PTHREAD_MUTEX_INITIALIZER
+};
+
+static pthread_mutex_t *mutex_assign(void)
+{
+	return &mutexes[uatomic_add_return(&mutex_i, 1) & MUTEX_MASK].mtx;
+}
 
 static struct cds_lfht *
 lfht_new(void)
@@ -72,16 +98,16 @@ __attribute__((constructor)) static void resolve_malloc(void)
 
 #ifndef __FreeBSD__
 	real_malloc = dlsym(RTLD_NEXT, "malloc");
-	real_calloc = dlsym(RTLD_NEXT, "calloc");
-	real_realloc = dlsym(RTLD_NEXT, "realloc");
-	if (!real_calloc || !real_malloc || !real_realloc) {
-		fprintf(stderr, "missing calloc/malloc/realloc %p %p %p\n",
-			real_calloc, real_malloc, real_realloc);
+	real_memalign = dlsym(RTLD_NEXT, "aligned_alloc");
+	real_free = dlsym(RTLD_NEXT, "free");
+	if (!real_malloc || !real_memalign || !real_free) {
+		fprintf(stderr, "missing malloc/aligned_alloc/free\n"
+			"\t%p %p %p\n",
+			real_malloc, real_memalign, real_free);
 		_exit(1);
 	}
 	ready = 1;
 #endif
-
 	totals = lfht_new();
 	if (!totals)
 		fprintf(stderr, "failed to allocate totals table\n");
@@ -91,6 +117,21 @@ __attribute__((constructor)) static void resolve_malloc(void)
 				call_rcu_after_fork_child);
 	if (err)
 		fprintf(stderr, "pthread_atfork failed: %s\n", strerror(err));
+	page_size = sysconf(_SC_PAGESIZE);
+}
+
+static void
+mutex_lock(pthread_mutex_t *m)
+{
+	int err = pthread_mutex_lock(m);
+	assert(err == 0);
+}
+
+static void
+mutex_unlock(pthread_mutex_t *m)
+{
+	int err = pthread_mutex_unlock(m);
+	assert(err == 0);
 }
 
 #ifndef HAVE_MEMPCPY
@@ -142,18 +183,46 @@ static char *int2str(int num, char *dst, size_t * size)
  */
 static int has_ec_p(void)
 {
-	return (ruby_thread_has_gvl_p() && ruby_current_execution_context_ptr);
+	return (ruby_thread_has_gvl_p() && ruby_current_vm_ptr &&
+		ruby_current_execution_context_ptr);
 }
 
+/* allocated via real_malloc/real_free */
 struct src_loc {
 	struct rcu_head rcu_head;
+	pthread_mutex_t *mtx;
 	size_t calls;
 	size_t total;
 	struct cds_lfht_node hnode;
+	struct cds_list_head allocs; /* <=> alloc_hdr.node */
 	uint32_t hval;
 	uint32_t capa;
 	char k[];
 };
+
+/* every allocation has this in the header, maintain alignment with malloc  */
+struct alloc_hdr {
+	struct cds_list_head anode; /* <=> src_loc.allocs */
+	union {
+		struct {
+			size_t gen; /* rb_gc_count() */
+			struct src_loc *loc;
+		} live;
+		struct rcu_head dead;
+	} as;
+	void *real; /* what to call real_free on */
+	size_t size;
+};
+
+static struct alloc_hdr *ptr2hdr(void *p)
+{
+	return (struct alloc_hdr *)((uintptr_t)p - sizeof(struct alloc_hdr));
+}
+
+static void *hdr2ptr(struct alloc_hdr *h)
+{
+	return (void *)((uintptr_t)h + sizeof(struct alloc_hdr));
+}
 
 static int loc_is_addr(const struct src_loc *l)
 {
@@ -177,13 +246,12 @@ static int loc_eq(struct cds_lfht_node *node, const void *key)
 		memcmp(k->k, existing->k, loc_size(k)) == 0);
 }
 
-static void totals_add(struct src_loc *k)
+static struct src_loc *totals_add(struct src_loc *k)
 {
 	struct cds_lfht_iter iter;
 	struct cds_lfht_node *cur;
-	struct src_loc *l;
+	struct src_loc *l = 0;
 	struct cds_lfht *t;
-
 
 again:
 	rcu_read_lock();
@@ -197,25 +265,27 @@ again:
 		uatomic_add(&l->calls, 1);
 	} else {
 		size_t n = loc_size(k);
-		l = malloc(sizeof(*l) + n);
+		l = real_malloc(sizeof(*l) + n);
 		if (!l) goto out_unlock;
-
 		memcpy(l, k, sizeof(*l) + n);
+		l->mtx = mutex_assign();
 		l->calls = 1;
+		CDS_INIT_LIST_HEAD(&l->allocs);
 		cur = cds_lfht_add_unique(t, k->hval, loc_eq, l, &l->hnode);
 		if (cur != &l->hnode) { /* lost race */
 			rcu_read_unlock();
-			free(l);
+			real_free(l);
 			goto again;
 		}
 	}
 out_unlock:
 	rcu_read_unlock();
+	return l;
 }
 
-static void update_stats(size_t size, uintptr_t caller)
+static struct src_loc *update_stats(size_t size, uintptr_t caller)
 {
-	struct src_loc *k;
+	struct src_loc *k, *ret = 0;
 	static const size_t xlen = sizeof(caller);
 	char *dst;
 
@@ -226,6 +296,8 @@ static void update_stats(size_t size, uintptr_t caller)
 		const char *ptr = rb_source_location_cstr(&line);
 		size_t len;
 		size_t int_size = INT2STR_MAX;
+
+		generation = rb_gc_count();
 
 		if (!ptr) goto unknown;
 
@@ -240,7 +312,7 @@ static void update_stats(size_t size, uintptr_t caller)
 			*dst = 0;	/* terminate string */
 			k->capa = (uint32_t)(dst - k->k + 1);
 			k->hval = jhash(k->k, k->capa, 0xdeadbeef);
-			totals_add(k);
+			ret = totals_add(k);
 		} else {
 			rb_bug("bad math making key from location %s:%d\n",
 				ptr, line);
@@ -252,36 +324,206 @@ unknown:
 		memcpy(k->k, &caller, xlen);
 		k->capa = 0;
 		k->hval = jhash(k->k, xlen, 0xdeadbeef);
-		totals_add(k);
+		ret = totals_add(k);
 	}
 out:
 	--locating;
+	return ret;
 }
 
-/*
- * Do we care for *memalign? ruby/gc.c uses it in ways this lib
- * doesn't care about, but maybe some gems use it, too.
- */
+size_t malloc_usable_size(void *p)
+{
+	return ptr2hdr(p)->size;
+}
+
+static void
+free_hdr_rcu(struct rcu_head *dead)
+{
+	struct alloc_hdr *h = caa_container_of(dead, struct alloc_hdr, as.dead);
+	real_free(h->real);
+}
+
+void free(void *p)
+{
+	if (p) {
+		struct alloc_hdr *h = ptr2hdr(p);
+		if (h->as.live.loc) {
+			h->size = 0;
+			mutex_lock(h->as.live.loc->mtx);
+			cds_list_del_rcu(&h->anode);
+			mutex_unlock(h->as.live.loc->mtx);
+			call_rcu(&h->as.dead, free_hdr_rcu);
+		}
+		else {
+			real_free(h->real);
+		}
+	}
+}
+
+static void
+alloc_insert(struct src_loc *l, struct alloc_hdr *h, size_t size, void *real)
+{
+	if (!h) return;
+	h->size = size;
+	h->real = real;
+	h->as.live.loc = l;
+	h->as.live.gen = generation;
+	if (l) {
+		mutex_lock(l->mtx);
+		cds_list_add_rcu(&h->anode, &l->allocs);
+		mutex_unlock(l->mtx);
+	}
+}
+
+static size_t size_align(size_t size, size_t alignment)
+{
+	return ((size + (alignment - 1)) & ~(alignment - 1));
+}
+
+static void *internal_memalign(size_t alignment, size_t size, uintptr_t caller)
+{
+	struct src_loc *l;
+	struct alloc_hdr *h;
+	void *p, *real;
+	size_t asize;
+
+	RETURN_IF_NOT_READY();
+	if (alignment <= ASSUMED_MALLOC_ALIGNMENT)
+		return malloc(size);
+	for (; alignment < sizeof(struct alloc_hdr); alignment *= 2)
+		; /* double alignment until >= sizeof(struct alloc_hdr) */
+	if (__builtin_add_overflow(size, alignment, &asize)) {
+		errno = ENOMEM;
+		return 0;
+	}
+	l = update_stats(size, caller);
+	real = real_memalign(alignment, asize);
+	p = (void *)((uintptr_t)real + alignment);
+	h = (struct alloc_hdr *)((uintptr_t)p - sizeof(struct alloc_hdr));
+	alloc_insert(l, h, size, real);
+
+	return p;
+}
+
+void *memalign(size_t alignment, size_t size)
+{
+	return internal_memalign(alignment, size, RETURN_ADDRESS(0));
+}
+
+static bool is_power_of_two(size_t n) { return (n & (n - 1)) == 0; }
+
+int posix_memalign(void **p, size_t alignment, size_t size)
+{
+	size_t d = alignment / sizeof(void*);
+	size_t r = alignment % sizeof(void*);
+
+	if (r != 0 || d == 0 || !is_power_of_two(d))
+		return EINVAL;
+
+	*p = internal_memalign(alignment, size, RETURN_ADDRESS(0));
+	return *p ? 0 : ENOMEM;
+}
+
+void *aligned_alloc(size_t, size_t) __attribute__((alias("memalign")));
+void cfree(void *) __attribute__((alias("free")));
+
+void *valloc(size_t size)
+{
+	return internal_memalign(page_size, size, RETURN_ADDRESS(0));
+}
+
+#if __GNUC__ < 7
+#  define add_overflow_p(a,b) __extension__({ \
+		__typeof__(a) _c; \
+		__builtin_add_overflow(a,b,&_c); \
+	})
+#else
+#  define add_overflow_p(a,b) \
+		__builtin_add_overflow_p((a),(b),(__typeof__(a+b))0)
+#endif
+
+void *pvalloc(size_t size)
+{
+	size_t alignment = page_size;
+
+	if (add_overflow_p(size, alignment)) {
+		errno = ENOMEM;
+		return 0;
+	}
+	size = size_align(size, alignment);
+	return internal_memalign(alignment, size, RETURN_ADDRESS(0));
+}
+
 void *malloc(size_t size)
 {
+	struct src_loc *l;
+	struct alloc_hdr *h;
+	size_t asize;
+
+	if (__builtin_add_overflow(size, sizeof(struct alloc_hdr), &asize)) {
+		errno = ENOMEM;
+		return 0;
+	}
 	RETURN_IF_NOT_READY();
-	update_stats(size, RETURN_ADDRESS(0));
-	return real_malloc(size);
+	l = update_stats(size, RETURN_ADDRESS(0));
+	h = real_malloc(asize);
+	if (!h) return 0;
+	alloc_insert(l, h, size, h);
+	return hdr2ptr(h);
 }
 
 void *calloc(size_t nmemb, size_t size)
 {
+	void *p;
+	struct src_loc *l;
+	struct alloc_hdr *h;
+	size_t asize;
+
+	if (__builtin_mul_overflow(size, nmemb, &size)) {
+		errno = ENOMEM;
+		return 0;
+	}
+	if (__builtin_add_overflow(size, sizeof(struct alloc_hdr), &asize)) {
+		errno = ENOMEM;
+		return 0;
+	}
 	RETURN_IF_NOT_READY();
-	/* ruby_xcalloc already does overflow checking */
-	update_stats(nmemb * size, RETURN_ADDRESS(0));
-	return real_calloc(nmemb, size);
+	l = update_stats(size, RETURN_ADDRESS(0));
+	h = real_malloc(asize);
+	if (!h) return 0;
+	alloc_insert(l, h, size, h);
+	p = hdr2ptr(h);
+	memset(p, 0, size);
+	return p;
 }
 
 void *realloc(void *ptr, size_t size)
 {
+	void *p;
+	struct src_loc *l;
+	struct alloc_hdr *h;
+	size_t asize;
+
+	if (!size) {
+		free(ptr);
+		return 0;
+	}
+	if (__builtin_add_overflow(size, sizeof(struct alloc_hdr), &asize)) {
+		errno = ENOMEM;
+		return 0;
+	}
 	RETURN_IF_NOT_READY();
-	update_stats(size, RETURN_ADDRESS(0));
-	return real_realloc(ptr, size);
+	l = update_stats(size, RETURN_ADDRESS(0));
+	h = real_malloc(asize);
+	if (!h) return 0;
+	alloc_insert(l, h, size, h);
+	p = hdr2ptr(h);
+	if (ptr) {
+		struct alloc_hdr *old = ptr2hdr(ptr);
+		memcpy(p, ptr, old->size < size ? old->size : size);
+		free(ptr);
+	}
+	return p;
 }
 
 struct dump_arg {
@@ -360,7 +602,7 @@ static void
 free_src_loc(struct rcu_head *head)
 {
 	struct src_loc *l = caa_container_of(head, struct src_loc, rcu_head);
-	free(l);
+	real_free(l);
 }
 
 static void *totals_clear(void *ign)
