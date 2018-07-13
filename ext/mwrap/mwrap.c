@@ -39,16 +39,13 @@ int __attribute__((weak)) ruby_thread_has_gvl_p(void)
 
 #ifdef __FreeBSD__
 void *__malloc(size_t);
-void *__memalign(size_t, size_t);
 void __free(void *);
 static void *(*real_malloc)(size_t) = __malloc;
-static void *(*real_memalign)(size_t, size_t) = __aligned_alloc;
 static void (*real_free)(void *) = __free;
 #  define RETURN_IF_NOT_READY() do {} while (0) /* nothing */
 #else
 static int ready;
 static void *(*real_malloc)(size_t);
-static void *(*real_memalign)(size_t, size_t);
 static void (*real_free)(void *);
 
 /*
@@ -98,12 +95,10 @@ __attribute__((constructor)) static void resolve_malloc(void)
 
 #ifndef __FreeBSD__
 	real_malloc = dlsym(RTLD_NEXT, "malloc");
-	real_memalign = dlsym(RTLD_NEXT, "aligned_alloc");
 	real_free = dlsym(RTLD_NEXT, "free");
-	if (!real_malloc || !real_memalign || !real_free) {
+	if (!real_malloc || !real_free) {
 		fprintf(stderr, "missing malloc/aligned_alloc/free\n"
-			"\t%p %p %p\n",
-			real_malloc, real_memalign, real_free);
+			"\t%p %p\n", real_malloc, real_free);
 		_exit(1);
 	}
 	ready = 1;
@@ -380,6 +375,16 @@ static size_t size_align(size_t size, size_t alignment)
 	return ((size + (alignment - 1)) & ~(alignment - 1));
 }
 
+static bool ptr_is_aligned(void *ptr, size_t alignment)
+{
+	return ((uintptr_t)ptr & (alignment - 1)) == 0;
+}
+
+static void *ptr_align(void *ptr, size_t alignment)
+{
+	return (void *)(((uintptr_t)ptr + (alignment - 1)) & ~(alignment - 1));
+}
+
 static void *internal_memalign(size_t alignment, size_t size, uintptr_t caller)
 {
 	struct src_loc *l;
@@ -392,14 +397,18 @@ static void *internal_memalign(size_t alignment, size_t size, uintptr_t caller)
 		return malloc(size);
 	for (; alignment < sizeof(struct alloc_hdr); alignment *= 2)
 		; /* double alignment until >= sizeof(struct alloc_hdr) */
-	if (__builtin_add_overflow(size, alignment, &asize)) {
+	if (__builtin_add_overflow(size, alignment, &asize) ||
+	    __builtin_add_overflow(asize, sizeof(struct alloc_hdr), &asize)) {
 		errno = ENOMEM;
 		return 0;
 	}
+	/* assert(asize == (alignment + size + sizeof(struct alloc_hdr))); */
 	l = update_stats(size, caller);
-	real = real_memalign(alignment, asize);
-	p = (void *)((uintptr_t)real + alignment);
-	h = (struct alloc_hdr *)((uintptr_t)p - sizeof(struct alloc_hdr));
+	real = real_malloc(asize);
+	p = hdr2ptr(real);
+	if (!ptr_is_aligned(p, alignment))
+		p = ptr_align(p, alignment);
+	h = ptr2hdr(p);
 	alloc_insert(l, h, size, real);
 
 	return p;
