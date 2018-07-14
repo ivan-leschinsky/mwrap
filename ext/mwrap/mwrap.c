@@ -42,12 +42,11 @@ void *__malloc(size_t);
 void __free(void *);
 static void *(*real_malloc)(size_t) = __malloc;
 static void (*real_free)(void *) = __free;
-static const int ready = 1;
 #else
-static int ready;
 static void *(*real_malloc)(size_t);
 static void (*real_free)(void *);
 #endif /* !FreeBSD */
+static int resolving_malloc;
 
 /*
  * we need to fake an OOM condition while dlsym is running,
@@ -55,7 +54,7 @@ static void (*real_free)(void *);
  * symbol for the jemalloc calloc, yet
  */
 #  define RETURN_IF_NOT_READY() do { \
-	if (!ready) { \
+	if (!real_malloc) { \
 		errno = ENOMEM; \
 		return NULL; \
 	} \
@@ -93,14 +92,16 @@ __attribute__((constructor)) static void resolve_malloc(void)
 	int err;
 
 #ifndef __FreeBSD__
-	real_malloc = dlsym(RTLD_NEXT, "malloc");
+	if (!real_malloc) {
+		resolving_malloc = 1;
+		real_malloc = dlsym(RTLD_NEXT, "malloc");
+	}
 	real_free = dlsym(RTLD_NEXT, "free");
 	if (!real_malloc || !real_free) {
 		fprintf(stderr, "missing malloc/aligned_alloc/free\n"
 			"\t%p %p\n", real_malloc, real_free);
 		_exit(1);
 	}
-	ready = 1;
 #endif
 	totals = lfht_new();
 	if (!totals)
@@ -343,6 +344,8 @@ void free(void *p)
 {
 	if (p) {
 		struct alloc_hdr *h = ptr2hdr(p);
+
+		if (!real_free) return; /* oh well, leak a little */
 		if (h->as.live.loc) {
 			h->size = 0;
 			mutex_lock(h->as.live.loc->mtx);
@@ -400,7 +403,7 @@ internal_memalign(void **pp, size_t alignment, size_t size, uintptr_t caller)
 	size_t d = alignment / sizeof(void*);
 	size_t r = alignment % sizeof(void*);
 
-	if (!ready) return ENOMEM;
+	if (!real_malloc) return ENOMEM;
 
 	if (r != 0 || d == 0 || !is_power_of_two(d))
 		return EINVAL;
@@ -498,11 +501,19 @@ void *malloc(size_t size)
 	size_t asize;
 	void *p;
 
-	if (__builtin_add_overflow(size, sizeof(struct alloc_hdr), &asize)) {
-		errno = ENOMEM;
-		return 0;
+	if (__builtin_add_overflow(size, sizeof(struct alloc_hdr), &asize))
+		goto enomem;
+
+	/*
+	 * Needed for C++ global declarations using "new",
+	 * which happens before our constructor
+	 */
+	if (!real_malloc) {
+		if (resolving_malloc) goto enomem;
+		resolving_malloc = 1;
+		real_malloc = dlsym(RTLD_NEXT, "malloc");
 	}
-	RETURN_IF_NOT_READY();
+
 	rcu_read_lock();
 	l = update_stats_rcu(size, RETURN_ADDRESS(0));
 	p = h = real_malloc(asize);
@@ -513,6 +524,9 @@ void *malloc(size_t size)
 	rcu_read_unlock();
 	if (caa_unlikely(!p)) errno = ENOMEM;
 	return p;
+enomem:
+	errno = ENOMEM;
+	return 0;
 }
 
 void *calloc(size_t nmemb, size_t size)

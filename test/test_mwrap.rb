@@ -61,6 +61,22 @@ class TestMwrap < Test::Unit::TestCase
     end
   end
 
+  def test_cmake
+    begin
+      exp = `cmake -h`
+    rescue Errno::ENOENT
+      warn 'cmake missing'
+      return
+    end
+    assert_not_predicate exp.strip, :empty?
+    env = @@env.merge('MWRAP' => 'dump_fd:1')
+    out = IO.popen(env, %w(cmake -h), &:read)
+    assert out.start_with?(exp), 'original help exists'
+    assert_not_equal exp, out, 'includes dump output'
+    dump = out.delete_prefix(exp)
+    assert_match(/\b0x[a-f0-9]+\b/s, dump, 'dump output has addresses')
+  end
+
   def test_clear
     cmd = @@cmd + %w(
       -e ("0"*10000).clear
