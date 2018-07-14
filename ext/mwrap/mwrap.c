@@ -241,7 +241,7 @@ static int loc_eq(struct cds_lfht_node *node, const void *key)
 		memcmp(k->k, existing->k, loc_size(k)) == 0);
 }
 
-static struct src_loc *totals_add(struct src_loc *k)
+static struct src_loc *totals_add_rcu(struct src_loc *k)
 {
 	struct cds_lfht_iter iter;
 	struct cds_lfht_node *cur;
@@ -249,7 +249,6 @@ static struct src_loc *totals_add(struct src_loc *k)
 	struct cds_lfht *t;
 
 again:
-	rcu_read_lock();
 	t = rcu_dereference(totals);
 	if (!t) goto out_unlock;
 	cds_lfht_lookup(t, k->hval, loc_eq, k, &iter);
@@ -270,19 +269,21 @@ again:
 		if (cur != &l->hnode) { /* lost race */
 			rcu_read_unlock();
 			real_free(l);
+			rcu_read_lock();
 			goto again;
 		}
 	}
 out_unlock:
-	rcu_read_unlock();
 	return l;
 }
 
-static struct src_loc *update_stats(size_t size, uintptr_t caller)
+static struct src_loc *update_stats_rcu(size_t size, uintptr_t caller)
 {
 	struct src_loc *k, *ret = 0;
 	static const size_t xlen = sizeof(caller);
 	char *dst;
+
+	assert(rcu_read_ongoing());
 
 	if (locating++) goto out; /* do not recurse into another *alloc */
 
@@ -307,7 +308,7 @@ static struct src_loc *update_stats(size_t size, uintptr_t caller)
 			*dst = 0;	/* terminate string */
 			k->capa = (uint32_t)(dst - k->k + 1);
 			k->hval = jhash(k->k, k->capa, 0xdeadbeef);
-			ret = totals_add(k);
+			ret = totals_add_rcu(k);
 		} else {
 			rb_bug("bad math making key from location %s:%d\n",
 				ptr, line);
@@ -319,7 +320,7 @@ unknown:
 		memcpy(k->k, &caller, xlen);
 		k->capa = 0;
 		k->hval = jhash(k->k, xlen, 0xdeadbeef);
-		ret = totals_add(k);
+		ret = totals_add_rcu(k);
 	}
 out:
 	--locating;
@@ -356,8 +357,10 @@ void free(void *p)
 }
 
 static void
-alloc_insert(struct src_loc *l, struct alloc_hdr *h, size_t size, void *real)
+alloc_insert_rcu(struct src_loc *l, struct alloc_hdr *h, size_t size, void *real)
 {
+	/* we need src_loc to remain alive for the duration of this call */
+	assert(rcu_read_ongoing());
 	if (!h) return;
 	h->size = size;
 	h->real = real;
@@ -403,13 +406,15 @@ static void *internal_memalign(size_t alignment, size_t size, uintptr_t caller)
 		return 0;
 	}
 	/* assert(asize == (alignment + size + sizeof(struct alloc_hdr))); */
-	l = update_stats(size, caller);
+	rcu_read_lock();
+	l = update_stats_rcu(size, caller);
 	real = real_malloc(asize);
 	p = hdr2ptr(real);
 	if (!ptr_is_aligned(p, alignment))
 		p = ptr_align(p, alignment);
 	h = ptr2hdr(p);
-	alloc_insert(l, h, size, real);
+	alloc_insert_rcu(l, h, size, real);
+	rcu_read_unlock();
 
 	return p;
 }
@@ -468,17 +473,22 @@ void *malloc(size_t size)
 	struct src_loc *l;
 	struct alloc_hdr *h;
 	size_t asize;
+	void *p;
 
 	if (__builtin_add_overflow(size, sizeof(struct alloc_hdr), &asize)) {
 		errno = ENOMEM;
 		return 0;
 	}
 	RETURN_IF_NOT_READY();
-	l = update_stats(size, RETURN_ADDRESS(0));
-	h = real_malloc(asize);
-	if (!h) return 0;
-	alloc_insert(l, h, size, h);
-	return hdr2ptr(h);
+	rcu_read_lock();
+	l = update_stats_rcu(size, RETURN_ADDRESS(0));
+	p = h = real_malloc(asize);
+	if (h) {
+		alloc_insert_rcu(l, h, size, h);
+		p = hdr2ptr(h);
+	}
+	rcu_read_unlock();
+	return p;
 }
 
 void *calloc(size_t nmemb, size_t size)
@@ -497,12 +507,15 @@ void *calloc(size_t nmemb, size_t size)
 		return 0;
 	}
 	RETURN_IF_NOT_READY();
-	l = update_stats(size, RETURN_ADDRESS(0));
-	h = real_malloc(asize);
-	if (!h) return 0;
-	alloc_insert(l, h, size, h);
-	p = hdr2ptr(h);
-	memset(p, 0, size);
+	rcu_read_lock();
+	l = update_stats_rcu(size, RETURN_ADDRESS(0));
+	p = h = real_malloc(asize);
+	if (p) {
+		alloc_insert_rcu(l, h, size, h);
+		p = hdr2ptr(h);
+		memset(p, 0, size);
+	}
+	rcu_read_unlock();
 	return p;
 }
 
@@ -522,11 +535,16 @@ void *realloc(void *ptr, size_t size)
 		return 0;
 	}
 	RETURN_IF_NOT_READY();
-	l = update_stats(size, RETURN_ADDRESS(0));
-	h = real_malloc(asize);
-	if (!h) return 0;
-	alloc_insert(l, h, size, h);
-	p = hdr2ptr(h);
+
+	rcu_read_lock();
+	l = update_stats_rcu(size, RETURN_ADDRESS(0));
+	p = h = real_malloc(asize);
+	if (p) {
+		alloc_insert_rcu(l, h, size, h);
+		p = hdr2ptr(h);
+	}
+	rcu_read_unlock();
+
 	if (ptr) {
 		struct alloc_hdr *old = ptr2hdr(ptr);
 		memcpy(p, ptr, old->size < size ? old->size : size);
