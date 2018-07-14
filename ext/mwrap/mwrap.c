@@ -545,7 +545,7 @@ void *realloc(void *ptr, size_t size)
 	}
 	rcu_read_unlock();
 
-	if (ptr) {
+	if (ptr && p) {
 		struct alloc_hdr *old = ptr2hdr(ptr);
 		memcpy(p, ptr, old->size < size ? old->size : size);
 		free(ptr);
