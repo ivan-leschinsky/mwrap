@@ -408,12 +408,14 @@ static void *internal_memalign(size_t alignment, size_t size, uintptr_t caller)
 	/* assert(asize == (alignment + size + sizeof(struct alloc_hdr))); */
 	rcu_read_lock();
 	l = update_stats_rcu(size, caller);
-	real = real_malloc(asize);
-	p = hdr2ptr(real);
-	if (!ptr_is_aligned(p, alignment))
-		p = ptr_align(p, alignment);
-	h = ptr2hdr(p);
-	alloc_insert_rcu(l, h, size, real);
+	p = real = real_malloc(asize);
+	if (real) {
+		p = hdr2ptr(real);
+		if (!ptr_is_aligned(p, alignment))
+			p = ptr_align(p, alignment);
+		h = ptr2hdr(p);
+		alloc_insert_rcu(l, h, size, real);
+	}
 	rcu_read_unlock();
 
 	return p;
