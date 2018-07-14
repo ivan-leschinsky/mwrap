@@ -291,6 +291,7 @@ static struct src_loc *update_stats_rcu(size_t size, uintptr_t caller)
 		const char *ptr = rb_source_location_cstr(&line);
 		size_t len;
 		size_t int_size = INT2STR_MAX;
+		static char buf[PATH_MAX + INT2STR_MAX + sizeof(*k) + 2];
 
 		generation = rb_gc_count();
 
@@ -298,7 +299,7 @@ static struct src_loc *update_stats_rcu(size_t size, uintptr_t caller)
 
 		/* avoid vsnprintf or anything which could call malloc here: */
 		len = strlen(ptr);
-		k = alloca(sizeof(*k) + len + 1 + int_size + 1);
+		k = (void *)buf;
 		k->total = size;
 		dst = mempcpy(k->k, ptr, len);
 		*dst++ = ':';
