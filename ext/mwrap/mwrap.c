@@ -401,10 +401,9 @@ static void *internal_memalign(size_t alignment, size_t size, uintptr_t caller)
 	for (; alignment < sizeof(struct alloc_hdr); alignment *= 2)
 		; /* double alignment until >= sizeof(struct alloc_hdr) */
 	if (__builtin_add_overflow(size, alignment, &asize) ||
-	    __builtin_add_overflow(asize, sizeof(struct alloc_hdr), &asize)) {
-		errno = ENOMEM;
+	    __builtin_add_overflow(asize, sizeof(struct alloc_hdr), &asize))
 		return 0;
-	}
+
 	/* assert(asize == (alignment + size + sizeof(struct alloc_hdr))); */
 	rcu_read_lock();
 	l = update_stats_rcu(size, caller);
@@ -423,7 +422,9 @@ static void *internal_memalign(size_t alignment, size_t size, uintptr_t caller)
 
 void *memalign(size_t alignment, size_t size)
 {
-	return internal_memalign(alignment, size, RETURN_ADDRESS(0));
+	void *p = internal_memalign(alignment, size, RETURN_ADDRESS(0));
+	if (caa_unlikely(!p)) errno = ENOMEM;
+	return p;
 }
 
 static bool is_power_of_two(size_t n) { return (n & (n - 1)) == 0; }
@@ -445,7 +446,9 @@ void cfree(void *) __attribute__((alias("free")));
 
 void *valloc(size_t size)
 {
-	return internal_memalign(page_size, size, RETURN_ADDRESS(0));
+	void *p = internal_memalign(page_size, size, RETURN_ADDRESS(0));
+	if (caa_unlikely(!p)) errno = ENOMEM;
+	return p;
 }
 
 #if __GNUC__ < 7
@@ -461,13 +464,16 @@ void *valloc(size_t size)
 void *pvalloc(size_t size)
 {
 	size_t alignment = page_size;
+	void *p;
 
 	if (add_overflow_p(size, alignment)) {
 		errno = ENOMEM;
 		return 0;
 	}
 	size = size_align(size, alignment);
-	return internal_memalign(alignment, size, RETURN_ADDRESS(0));
+	p = internal_memalign(alignment, size, RETURN_ADDRESS(0));
+	if (caa_unlikely(!p)) errno = ENOMEM;
+	return p;
 }
 
 void *malloc(size_t size)
@@ -490,6 +496,7 @@ void *malloc(size_t size)
 		p = hdr2ptr(h);
 	}
 	rcu_read_unlock();
+	if (caa_unlikely(!p)) errno = ENOMEM;
 	return p;
 }
 
@@ -518,6 +525,7 @@ void *calloc(size_t nmemb, size_t size)
 		memset(p, 0, size);
 	}
 	rcu_read_unlock();
+	if (caa_unlikely(!p)) errno = ENOMEM;
 	return p;
 }
 
@@ -552,6 +560,7 @@ void *realloc(void *ptr, size_t size)
 		memcpy(p, ptr, old->size < size ? old->size : size);
 		free(ptr);
 	}
+	if (caa_unlikely(!p)) errno = ENOMEM;
 	return p;
 }
 
