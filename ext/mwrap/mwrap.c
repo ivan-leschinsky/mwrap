@@ -186,8 +186,11 @@ static int has_ec_p(void)
 /* allocated via real_malloc/real_free */
 struct src_loc {
 	pthread_mutex_t *mtx;
-	size_t calls;
 	size_t total;
+	size_t allocations;
+	size_t frees;
+	size_t age_total; /* (age_total / frees) => mean age at free */
+	size_t max_lifespan;
 	struct cds_lfht_node hnode;
 	struct cds_list_head allocs; /* <=> alloc_hdr.node */
 	uint32_t hval;
@@ -258,14 +261,17 @@ again:
 	if (cur) {
 		l = caa_container_of(cur, struct src_loc, hnode);
 		uatomic_add(&l->total, k->total);
-		uatomic_add(&l->calls, 1);
+		uatomic_add(&l->allocations, 1);
 	} else {
 		size_t n = loc_size(k);
 		l = real_malloc(sizeof(*l) + n);
 		if (!l) goto out_unlock;
 		memcpy(l, k, sizeof(*l) + n);
 		l->mtx = mutex_assign();
-		l->calls = 1;
+		l->age_total = 0;
+		l->max_lifespan = 0;
+		l->frees = 0;
+		l->allocations = 1;
 		CDS_INIT_LIST_HEAD(&l->allocs);
 		cur = cds_lfht_add_unique(t, k->hval, loc_eq, l, &l->hnode);
 		if (cur != &l->hnode) { /* lost race */
@@ -345,13 +351,22 @@ void free(void *p)
 {
 	if (p) {
 		struct alloc_hdr *h = ptr2hdr(p);
+		struct src_loc *l = h->as.live.loc;
 
 		if (!real_free) return; /* oh well, leak a little */
-		if (h->as.live.loc) {
+		if (l) {
+			size_t age = generation - h->as.live.gen;
+
 			uatomic_set(&h->size, 0);
-			mutex_lock(h->as.live.loc->mtx);
+			uatomic_add(&l->frees, 1);
+			uatomic_add(&l->age_total, age);
+
+			mutex_lock(l->mtx);
 			cds_list_del_rcu(&h->anode);
-			mutex_unlock(h->as.live.loc->mtx);
+			if (age > l->max_lifespan)
+				l->max_lifespan = age;
+			mutex_unlock(l->mtx);
+
 			call_rcu(&h->as.dead, free_hdr_rcu);
 		}
 		else {
@@ -621,7 +636,7 @@ static void *dump_to_file(void *x)
 			p = s[0];
 		}
 		fprintf(a->fp, "%16zu %12zu %s\n",
-			l->total, l->calls, (const char *)p);
+			l->total, l->allocations, (const char *)p);
 		if (s) free(s);
 	}
 out_unlock:
@@ -676,7 +691,10 @@ static void *totals_reset(void *ign)
 	t = rcu_dereference(totals);
 	cds_lfht_for_each_entry(t, &iter, l, hnode) {
 		uatomic_set(&l->total, 0);
-		uatomic_set(&l->calls, 0);
+		uatomic_set(&l->allocations, 0);
+		uatomic_set(&l->frees, 0);
+		uatomic_set(&l->age_total, 0);
+		uatomic_set(&l->max_lifespan, 0);
 	}
 	rcu_read_unlock();
 	return 0;
@@ -710,6 +728,27 @@ static VALUE rcu_unlock_ensure(VALUE ignored)
 	return Qfalse;
 }
 
+static VALUE location_string(struct src_loc *l)
+{
+	VALUE ret, tmp;
+
+	if (loc_is_addr(l)) {
+		char **s = backtrace_symbols((void *)l->k, 1);
+		tmp = rb_str_new_cstr(s[0]);
+		free(s);
+	}
+	else {
+		tmp = rb_str_new(l->k, l->capa - 1);
+	}
+
+	/* deduplicate and try to free up some memory */
+	ret = rb_funcall(tmp, id_uminus, 0);
+	if (!OBJ_FROZEN_RAW(tmp))
+		rb_str_resize(tmp, 0);
+
+	return ret;
+}
+
 static VALUE dump_each_rcu(VALUE x)
 {
 	struct dump_arg *a = (struct dump_arg *)x;
@@ -719,27 +758,17 @@ static VALUE dump_each_rcu(VALUE x)
 
 	t = rcu_dereference(totals);
 	cds_lfht_for_each_entry(t, &iter, l, hnode) {
-		VALUE v[3];
+		VALUE v[6];
 		if (l->total <= a->min) continue;
 
-		if (loc_is_addr(l)) {
-			char **s = backtrace_symbols((void *)l->k, 1);
-			v[1] = rb_str_new_cstr(s[0]);
-			free(s);
-		}
-		else {
-			v[1] = rb_str_new(l->k, l->capa - 1);
-		}
-
-		/* deduplicate and try to free up some memory */
-		v[0] = rb_funcall(v[1], id_uminus, 0);
-		if (!OBJ_FROZEN_RAW(v[1]))
-			rb_str_resize(v[1], 0);
-
+		v[0] = location_string(l);
 		v[1] = SIZET2NUM(l->total);
-		v[2] = SIZET2NUM(l->calls);
+		v[2] = SIZET2NUM(l->allocations);
+		v[3] = SIZET2NUM(l->frees);
+		v[4] = SIZET2NUM(l->age_total);
+		v[5] = SIZET2NUM(l->max_lifespan);
 
-		rb_yield_values2(3, v);
+		rb_yield_values2(6, v);
 		assert(rcu_read_ongoing());
 	}
 	return Qnil;
@@ -748,10 +777,12 @@ static VALUE dump_each_rcu(VALUE x)
 /*
  * call-seq:
  *
- * 	Mwrap.each([min]) { |location,total_bytes,call_count| ... }
+ *	Mwrap.each([min]) do |location,total,allocations,frees,age_total,max_lifespan|
+ *	  ...
+ *	end
  *
  * Yields each entry of the of the table to a caller-supplied block.
- * +min+ may be specified to filter out lines with +total_bytes+
+ * +min+ may be specified to filter out lines with +total+ bytes
  * equal-to-or-smaller-than the supplied minimum.
  */
 static VALUE mwrap_each(int argc, VALUE * argv, VALUE mod)
@@ -855,6 +886,14 @@ static VALUE src_loc_each_i(VALUE p)
 	return Qfalse;
 }
 
+static struct src_loc *src_loc_get(VALUE self)
+{
+	struct src_loc *l;
+	TypedData_Get_Struct(self, struct src_loc, &src_loc_type, l);
+	assert(l);
+	return l;
+}
+
 /*
  * call-seq:
  *	loc = Mwrap[location]
@@ -867,14 +906,57 @@ static VALUE src_loc_each_i(VALUE p)
  */
 static VALUE src_loc_each(VALUE self)
 {
-	struct src_loc *l;
-	TypedData_Get_Struct(self, struct src_loc, &src_loc_type, l);
+	struct src_loc *l = src_loc_get(self);
 
 	assert(locating == 0 && "forgot to clear locating");
 	++locating;
 	rcu_read_lock();
 	rb_ensure(src_loc_each_i, (VALUE)l, rcu_unlock_ensure, 0);
 	return self;
+}
+
+static VALUE src_loc_mean_lifespan(VALUE self)
+{
+	struct src_loc *l = src_loc_get(self);
+	size_t tot, frees;
+
+	frees = uatomic_read(&l->frees);
+	tot = uatomic_read(&l->age_total);
+	return DBL2NUM(frees ? ((double)tot/(double)frees) : HUGE_VAL);
+}
+
+static VALUE src_loc_frees(VALUE self)
+{
+	return SIZET2NUM(uatomic_read(&src_loc_get(self)->frees));
+}
+
+static VALUE src_loc_allocations(VALUE self)
+{
+	return SIZET2NUM(uatomic_read(&src_loc_get(self)->allocations));
+}
+
+static VALUE src_loc_total(VALUE self)
+{
+	return SIZET2NUM(uatomic_read(&src_loc_get(self)->total));
+}
+
+static VALUE src_loc_max_lifespan(VALUE self)
+{
+	return SIZET2NUM(uatomic_read(&src_loc_get(self)->max_lifespan));
+}
+
+/*
+ * Returns a frozen String location of the given SourceLocation object.
+ */
+static VALUE src_loc_name(VALUE self)
+{
+	struct src_loc *l = src_loc_get(self);
+	VALUE ret;
+
+	++locating;
+	ret = location_string(l);
+	--locating;
+	return ret;
 }
 
 /*
@@ -911,6 +993,12 @@ void Init_mwrap(void)
 	rb_define_singleton_method(mod, "each", mwrap_each, -1);
 	rb_define_singleton_method(mod, "[]", mwrap_aref, 1);
 	rb_define_method(cSrcLoc, "each", src_loc_each, 0);
+	rb_define_method(cSrcLoc, "frees", src_loc_frees, 0);
+	rb_define_method(cSrcLoc, "allocations", src_loc_allocations, 0);
+	rb_define_method(cSrcLoc, "total", src_loc_total, 0);
+	rb_define_method(cSrcLoc, "mean_lifespan", src_loc_mean_lifespan, 0);
+	rb_define_method(cSrcLoc, "max_lifespan", src_loc_max_lifespan, 0);
+	rb_define_method(cSrcLoc, "name", src_loc_name, 0);
 }
 
 /* rb_cloexec_open isn't usable by non-Ruby processes */

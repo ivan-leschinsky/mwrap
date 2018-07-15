@@ -203,4 +203,52 @@ class TestMwrap < Test::Unit::TestCase
   def test_mwrap_dump_check
     assert_raise(TypeError) { Mwrap.dump(:bogus) }
   end
+
+  def assert_separately(src, *opts)
+    Tempfile.create(%w(mwrap .rb)) do |tmp|
+      tmp.write(src.lstrip!)
+      tmp.flush
+      assert(system(@@env, *@@cmd, tmp.path, *opts))
+    end
+  end
+
+  def test_source_location
+    assert_separately(+"#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      require 'mwrap'
+      foo = '0' * 10000
+      k = -"#{__FILE__}:2"
+      loc = Mwrap[k]
+      loc.name == k or abort 'SourceLocation#name broken'
+      loc.total >= 10000 or abort 'SourceLocation#total broken'
+      loc.frees == 0 or abort 'SourceLocation#frees broken'
+      loc.allocations == 1 or abort 'SourceLocation#allocations broken'
+      seen = false
+      loc.each do |*x| seen = x end
+      seen[1] == loc.total or 'SourceLocation#each broken'
+      foo.clear
+
+      # wait for call_rcu to perform real_free
+      freed = false
+      until freed
+        freed = true
+        loc.each do freed = false end
+      end
+      loc.frees == 1 or abort 'SourceLocation#frees broken (after free)'
+      Float === loc.mean_lifespan or abort 'mean_lifespan broken'
+      Integer === loc.max_lifespan or abort 'max_lifespan broken'
+
+      addr = false
+      Mwrap.each do |a,|
+        if a =~ /\[0x[a-f0-9]+\]/
+          addr = a
+          break
+        end
+      end
+      addr.frozen? or abort 'Mwrap.each returned unfrozen address'
+      loc = Mwrap[addr] or abort "Mwrap[#{addr}] broken"
+      addr == loc.name or abort 'SourceLocation#name works on address'
+      loc.name.frozen? or abort 'SourceLocation#name not frozen'
+    end;
+  end
 end
