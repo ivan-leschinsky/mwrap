@@ -28,6 +28,7 @@ extern int __attribute__((weak)) ruby_thread_has_gvl_p(void);
 extern void * __attribute__((weak)) ruby_current_execution_context_ptr;
 extern void * __attribute__((weak)) ruby_current_vm_ptr; /* for rb_gc_count */
 extern size_t __attribute__((weak)) rb_gc_count(void);
+extern VALUE __attribute__((weak)) rb_cObject;
 
 /* true for glibc/dlmalloc/ptmalloc, not sure about jemalloc */
 #define ASSUMED_MALLOC_ALIGNMENT (sizeof(void *) * 2)
@@ -209,6 +210,8 @@ struct alloc_hdr {
 	size_t size;
 };
 
+static char kbuf[PATH_MAX + INT2STR_MAX + sizeof(struct alloc_hdr) + 2];
+
 static struct alloc_hdr *ptr2hdr(void *p)
 {
 	return (struct alloc_hdr *)((uintptr_t)p - sizeof(struct alloc_hdr));
@@ -292,7 +295,6 @@ static struct src_loc *update_stats_rcu(size_t size, uintptr_t caller)
 		const char *ptr = rb_source_location_cstr(&line);
 		size_t len;
 		size_t int_size = INT2STR_MAX;
-		static char buf[PATH_MAX + INT2STR_MAX + sizeof(*k) + 2];
 
 		generation = rb_gc_count();
 
@@ -300,7 +302,7 @@ static struct src_loc *update_stats_rcu(size_t size, uintptr_t caller)
 
 		/* avoid vsnprintf or anything which could call malloc here: */
 		len = strlen(ptr);
-		k = (void *)buf;
+		k = (void *)kbuf;
 		k->total = size;
 		dst = mempcpy(k->k, ptr, len);
 		*dst++ = ':';
@@ -347,7 +349,7 @@ void free(void *p)
 
 		if (!real_free) return; /* oh well, leak a little */
 		if (h->as.live.loc) {
-			h->size = 0;
+			uatomic_set(&h->size, 0);
 			mutex_lock(h->as.live.loc->mtx);
 			cds_list_del_rcu(&h->anode);
 			mutex_unlock(h->as.live.loc->mtx);
@@ -739,7 +741,7 @@ static VALUE mwrap_reset(VALUE mod)
 	return Qnil;
 }
 
-static VALUE dump_ensure(VALUE ignored)
+static VALUE rcu_unlock_ensure(VALUE ignored)
 {
 	rcu_read_unlock();
 	--locating;
@@ -801,7 +803,116 @@ static VALUE mwrap_each(int argc, VALUE * argv, VALUE mod)
 	++locating;
 	rcu_read_lock();
 
-	return rb_ensure(dump_each_rcu, (VALUE)&a, dump_ensure, 0);
+	return rb_ensure(dump_each_rcu, (VALUE)&a, rcu_unlock_ensure, 0);
+}
+
+static size_t
+src_loc_memsize(const void *p)
+{
+	return sizeof(struct src_loc);
+}
+
+static const rb_data_type_t src_loc_type = {
+	"source_location",
+	/* no marking, no freeing */
+	{ 0, 0, src_loc_memsize, /* reserved */ },
+	/* parent, data, [ flags ] */
+};
+
+static VALUE cSrcLoc;
+
+/*
+ * call-seq:
+ *	Mwrap[location] -> Mwrap::SourceLocation
+ *
+ * Returns the associated Mwrap::SourceLocation given the +location+
+ * String.  +location+ is either a Ruby source location path:line
+ * (e.g. "/path/to/foo.rb:5") or a hexadecimal memory address with
+ * square-braces part yielded by Mwrap.dump (e.g. "[0xdeadbeef]")
+ */
+static VALUE mwrap_aref(VALUE mod, VALUE loc)
+{
+	const char *str = StringValueCStr(loc);
+	long len = RSTRING_LEN(loc);
+	struct src_loc *k = 0;
+	uintptr_t p;
+	struct cds_lfht_iter iter;
+	struct cds_lfht_node *cur;
+	struct cds_lfht *t;
+	struct src_loc *l;
+	VALUE val = Qnil;
+	const char *c;
+
+	if ((c = memchr(str, '[', len)) && sscanf(c, "[%p]", (void **)&p)) {
+		k = (void *)kbuf;
+		memcpy(k->k, &p, sizeof(p));
+		k->capa = 0;
+		k->hval = jhash(k->k, sizeof(p), 0xdeadbeef);
+	} else {
+		k = (void *)kbuf;
+		memcpy(k->k, str, len + 1);
+		k->capa = len + 1;
+		k->hval = jhash(k->k, k->capa, 0xdeadbeef);
+	}
+
+	if (!k) return val;
+
+	rcu_read_lock();
+	t = rcu_dereference(totals);
+	if (!t) goto out_unlock;
+
+	cds_lfht_lookup(t, k->hval, loc_eq, k, &iter);
+	cur = cds_lfht_iter_get_node(&iter);
+	if (cur) {
+		l = caa_container_of(cur, struct src_loc, hnode);
+		val = TypedData_Wrap_Struct(cSrcLoc, &src_loc_type, l);
+	}
+out_unlock:
+	rcu_read_unlock();
+	return val;
+}
+
+static VALUE src_loc_each_i(VALUE p)
+{
+	struct alloc_hdr *h;
+	struct src_loc *l = (struct src_loc *)p;
+
+	cds_list_for_each_entry_rcu(h, &l->allocs, anode) {
+		size_t gen = uatomic_read(&h->as.live.gen);
+		size_t size = uatomic_read(&h->size);
+
+		if (size) {
+			VALUE v[2];
+			v[0] = SIZET2NUM(size);
+			v[1] = SIZET2NUM(gen);
+
+			rb_yield_values2(2, v);
+		}
+	}
+
+	return Qfalse;
+}
+
+/*
+ * call-seq:
+ *	loc = Mwrap[location]
+ *	loc.each { |size,generation| ... }
+ *
+ * Iterates through live allocations for a given Mwrap::SourceLocation,
+ * yielding the +size+ (in bytes) and +generation+ of each allocation.
+ * The +generation+ is the value of the GC.count method at the time
+ * the allocation was made.
+ */
+static VALUE src_loc_each(VALUE self)
+{
+	struct src_loc *l;
+	TypedData_Get_Struct(self, struct src_loc, &src_loc_type, l);
+
+	assert(locating == 0 && "forgot to clear locating");
+	++locating;
+	rcu_read_lock();
+	rb_ensure(src_loc_each_i, (VALUE)l, rcu_unlock_ensure, 0);
+	return self;
 }
 
 /*
@@ -831,10 +942,13 @@ void Init_mwrap(void)
 	VALUE mod = rb_define_module("Mwrap");
 	id_uminus = rb_intern("-@");
 
+	cSrcLoc = rb_define_class_under(mod, "SourceLocation", rb_cObject);
 	rb_define_singleton_method(mod, "dump", mwrap_dump, -1);
 	rb_define_singleton_method(mod, "clear", mwrap_clear, 0);
 	rb_define_singleton_method(mod, "reset", mwrap_reset, 0);
 	rb_define_singleton_method(mod, "each", mwrap_each, -1);
+	rb_define_singleton_method(mod, "[]", mwrap_aref, 1);
+	rb_define_method(cSrcLoc, "each", src_loc_each, 0);
 }
 
 /* rb_cloexec_open isn't usable by non-Ruby processes */

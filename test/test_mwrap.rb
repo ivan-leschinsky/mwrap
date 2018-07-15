@@ -163,6 +163,34 @@ class TestMwrap < Test::Unit::TestCase
     end
   end
 
+  def test_aref_each
+    cmd = @@cmd + %w(
+      -e count=GC.count
+      -e GC.disable
+      -e keep=("0"*10000)
+      -e loc=Mwrap["-e:3"]
+      -e loc.each{|size,gen|p([size,gen,count])}
+    )
+    buf = IO.popen(@@env, cmd, &:read)
+    assert_predicate $?, :success?
+    assert_match(/\A\[\s*\d+,\s*\d+,\s*\d+\]\s*\z/s, buf)
+    size, gen, count = eval(buf)
+    assert_operator size, :>=, 10000
+    assert_operator gen, :>=, count
+
+    cmd = @@cmd + %w(
+      -e count=GC.count
+      -e locs=""
+      -e Mwrap.each(1){|loc,tot,calls|locs<<loc}
+      -e m=locs.match(/(\[0x[a-f0-9]+\])/i)
+      -e p(loc=Mwrap["bobloblaw\t#{m[1]}"])
+      -e loc.each{|size,gen|p([size,gen,count])}
+    )
+    buf = IO.popen(@@env, cmd, &:read)
+    assert_predicate $?, :success?
+    assert_match(/\bMwrap::SourceLocation\b/, buf)
+  end
+
   def test_benchmark
     cmd = @@cmd + %w(-rbenchmark
       -e puts(Benchmark.measure{1000000.times{Time.now}}))
