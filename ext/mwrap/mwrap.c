@@ -185,7 +185,6 @@ static int has_ec_p(void)
 
 /* allocated via real_malloc/real_free */
 struct src_loc {
-	struct rcu_head rcu_head;
 	pthread_mutex_t *mtx;
 	size_t calls;
 	size_t total;
@@ -667,49 +666,6 @@ static VALUE mwrap_dump(int argc, VALUE * argv, VALUE mod)
 	return Qnil;
 }
 
-static void
-free_src_loc(struct rcu_head *head)
-{
-	struct src_loc *l = caa_container_of(head, struct src_loc, rcu_head);
-	real_free(l);
-}
-
-static void *totals_clear(void *ign)
-{
-	struct cds_lfht *new, *old;
-	struct cds_lfht_iter iter;
-	struct src_loc *l;
-
-	new = lfht_new();
-	rcu_read_lock();
-	old = rcu_dereference(totals);
-	rcu_assign_pointer(totals, new);
-	cds_lfht_for_each_entry(old, &iter, l, hnode) {
-		cds_lfht_del(old, &l->hnode);
-		call_rcu(&l->rcu_head, free_src_loc);
-	}
-	rcu_read_unlock();
-
-	synchronize_rcu(); /* ensure totals points to new */
-	cds_lfht_destroy(old, NULL);
-	return 0;
-}
-
-/*
- * call-seq:
- *
- *	Mwrap.clear -> nil
- *
- * Atomically replaces the totals table and destroys the old one.
- * This resets all statistics. It is more expensive than `Mwrap.reset'
- * as new allocations will need to be made to repopulate the new table.
- */
-static VALUE mwrap_clear(VALUE mod)
-{
-	rb_thread_call_without_gvl(totals_clear, 0, 0, 0);
-	return Qnil;
-}
-
 static void *totals_reset(void *ign)
 {
 	struct cds_lfht *t;
@@ -732,13 +688,19 @@ static void *totals_reset(void *ign)
  *	Mwrap.reset -> nil
  *
  * Resets the the total tables by zero-ing all counters.
- * This resets all statistics and is less costly than `Mwrap.clear'
- * but is not an atomic operation.
+ * This resets all statistics.  This is not an atomic operation
+ * as other threads (outside of GVL) may increment counters.
  */
 static VALUE mwrap_reset(VALUE mod)
 {
 	rb_thread_call_without_gvl(totals_reset, 0, 0, 0);
 	return Qnil;
+}
+
+/* :nodoc: */
+static VALUE mwrap_clear(VALUE mod)
+{
+	return mwrap_reset(mod);
 }
 
 static VALUE rcu_unlock_ensure(VALUE ignored)
@@ -944,8 +906,8 @@ void Init_mwrap(void)
 
 	cSrcLoc = rb_define_class_under(mod, "SourceLocation", rb_cObject);
 	rb_define_singleton_method(mod, "dump", mwrap_dump, -1);
-	rb_define_singleton_method(mod, "clear", mwrap_clear, 0);
 	rb_define_singleton_method(mod, "reset", mwrap_reset, 0);
+	rb_define_singleton_method(mod, "clear", mwrap_clear, 0);
 	rb_define_singleton_method(mod, "each", mwrap_each, -1);
 	rb_define_singleton_method(mod, "[]", mwrap_aref, 1);
 	rb_define_method(cSrcLoc, "each", src_loc_each, 0);
