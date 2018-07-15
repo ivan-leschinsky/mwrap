@@ -826,7 +826,7 @@ static VALUE cSrcLoc;
 static VALUE mwrap_aref(VALUE mod, VALUE loc)
 {
 	const char *str = StringValueCStr(loc);
-	long len = RSTRING_LEN(loc);
+	int len = RSTRING_LENINT(loc);
 	struct src_loc *k = 0;
 	uintptr_t p;
 	struct cds_lfht_iter iter;
