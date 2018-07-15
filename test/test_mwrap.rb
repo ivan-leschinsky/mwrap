@@ -183,6 +183,7 @@ class TestMwrap < Test::Unit::TestCase
       -e locs=""
       -e Mwrap.each(1){|loc,tot,calls|locs<<loc}
       -e m=locs.match(/(\[0x[a-f0-9]+\])/i)
+      -e m||=locs.match(/\b(0x[a-f0-9]+)\b/i)
       -e p(loc=Mwrap["bobloblaw\t#{m[1]}"])
       -e loc.each{|size,gen|p([size,gen,count])}
     )
@@ -240,12 +241,12 @@ class TestMwrap < Test::Unit::TestCase
 
       addr = false
       Mwrap.each do |a,|
-        if a =~ /\[0x[a-f0-9]+\]/
+        if a =~ /0x[a-f0-9]+/
           addr = a
           break
         end
       end
-      addr.frozen? or abort 'Mwrap.each returned unfrozen address'
+      addr && addr.frozen? or abort 'Mwrap.each returned unfrozen address'
       loc = Mwrap[addr] or abort "Mwrap[#{addr}] broken"
       addr == loc.name or abort 'SourceLocation#name works on address'
       loc.name.frozen? or abort 'SourceLocation#name not frozen'

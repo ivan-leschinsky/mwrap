@@ -41,13 +41,13 @@ int __attribute__((weak)) ruby_thread_has_gvl_p(void)
 #ifdef __FreeBSD__
 void *__malloc(size_t);
 void __free(void *);
-static void *(*real_malloc)(size_t) = __malloc;
-static void (*real_free)(void *) = __free;
+#  define real_malloc __malloc
+#  define real_free __free
 #else
 static void *(*real_malloc)(size_t);
 static void (*real_free)(void *);
-#endif /* !FreeBSD */
 static int resolving_malloc;
+#endif /* !FreeBSD */
 
 /*
  * we need to fake an OOM condition while dlsym is running,
@@ -92,7 +92,26 @@ __attribute__((constructor)) static void resolve_malloc(void)
 {
 	int err;
 
-#ifndef __FreeBSD__
+#ifdef __FreeBSD__
+	/*
+	 * PTHREAD_MUTEX_INITIALIZER on FreeBSD means lazy initialization,
+	 * which happens at pthread_mutex_lock, and that calls calloc
+	 */
+	{
+		size_t i;
+
+		for (i = 0; i < MUTEX_NR; i++) {
+			err = pthread_mutex_init(&mutexes[i].mtx, 0);
+			if (err) {
+				fprintf(stderr, "error: %s\n", strerror(err));
+				_exit(1);
+			}
+		}
+		/* initialize mutexes used by urcu-bp */
+		rcu_read_lock();
+		rcu_read_unlock();
+	}
+#else /* !FreeBSD (tested on GNU/Linux) */
 	if (!real_malloc) {
 		resolving_malloc = 1;
 		real_malloc = dlsym(RTLD_NEXT, "malloc");
@@ -103,7 +122,7 @@ __attribute__((constructor)) static void resolve_malloc(void)
 			"\t%p %p\n", real_malloc, real_free);
 		_exit(1);
 	}
-#endif
+#endif /* !FreeBSD */
 	totals = lfht_new();
 	if (!totals)
 		fprintf(stderr, "failed to allocate totals table\n");
@@ -285,16 +304,21 @@ out_unlock:
 	return l;
 }
 
-static struct src_loc *update_stats_rcu(size_t size, uintptr_t caller)
+static void update_stats_rcu_unlock(const struct src_loc *l)
+{
+	if (caa_likely(l)) rcu_read_unlock();
+}
+
+static struct src_loc *update_stats_rcu_lock(size_t size, uintptr_t caller)
 {
 	struct src_loc *k, *ret = 0;
 	static const size_t xlen = sizeof(caller);
 	char *dst;
 
-	assert(rcu_read_ongoing());
-
+	if (caa_unlikely(!totals)) return 0;
 	if (locating++) goto out; /* do not recurse into another *alloc */
 
+	rcu_read_lock();
 	if (has_ec_p()) {
 		int line;
 		const char *ptr = rb_source_location_cstr(&line);
@@ -379,7 +403,6 @@ static void
 alloc_insert_rcu(struct src_loc *l, struct alloc_hdr *h, size_t size, void *real)
 {
 	/* we need src_loc to remain alive for the duration of this call */
-	assert(rcu_read_ongoing());
 	if (!h) return;
 	h->size = size;
 	h->real = real;
@@ -437,8 +460,7 @@ internal_memalign(void **pp, size_t alignment, size_t size, uintptr_t caller)
 		return ENOMEM;
 
 	/* assert(asize == (alignment + size + sizeof(struct alloc_hdr))); */
-	rcu_read_lock();
-	l = update_stats_rcu(size, caller);
+	l = update_stats_rcu_lock(size, caller);
 	real = real_malloc(asize);
 	if (real) {
 		void *p = hdr2ptr(real);
@@ -448,7 +470,7 @@ internal_memalign(void **pp, size_t alignment, size_t size, uintptr_t caller)
 		alloc_insert_rcu(l, h, size, real);
 		*pp = p;
 	}
-	rcu_read_unlock();
+	update_stats_rcu_unlock(l);
 
 	return real ? 0 : ENOMEM;
 }
@@ -524,20 +546,20 @@ void *malloc(size_t size)
 	 * Needed for C++ global declarations using "new",
 	 * which happens before our constructor
 	 */
+#ifndef __FreeBSD__
 	if (!real_malloc) {
 		if (resolving_malloc) goto enomem;
 		resolving_malloc = 1;
 		real_malloc = dlsym(RTLD_NEXT, "malloc");
 	}
-
-	rcu_read_lock();
-	l = update_stats_rcu(size, RETURN_ADDRESS(0));
+#endif
+	l = update_stats_rcu_lock(size, RETURN_ADDRESS(0));
 	p = h = real_malloc(asize);
 	if (h) {
 		alloc_insert_rcu(l, h, size, h);
 		p = hdr2ptr(h);
 	}
-	rcu_read_unlock();
+	update_stats_rcu_unlock(l);
 	if (caa_unlikely(!p)) errno = ENOMEM;
 	return p;
 enomem:
@@ -561,15 +583,14 @@ void *calloc(size_t nmemb, size_t size)
 		return 0;
 	}
 	RETURN_IF_NOT_READY();
-	rcu_read_lock();
-	l = update_stats_rcu(size, RETURN_ADDRESS(0));
+	l = update_stats_rcu_lock(size, RETURN_ADDRESS(0));
 	p = h = real_malloc(asize);
 	if (p) {
 		alloc_insert_rcu(l, h, size, h);
 		p = hdr2ptr(h);
 		memset(p, 0, size);
 	}
-	rcu_read_unlock();
+	update_stats_rcu_unlock(l);
 	if (caa_unlikely(!p)) errno = ENOMEM;
 	return p;
 }
@@ -591,14 +612,13 @@ void *realloc(void *ptr, size_t size)
 	}
 	RETURN_IF_NOT_READY();
 
-	rcu_read_lock();
-	l = update_stats_rcu(size, RETURN_ADDRESS(0));
+	l = update_stats_rcu_lock(size, RETURN_ADDRESS(0));
 	p = h = real_malloc(asize);
 	if (p) {
 		alloc_insert_rcu(l, h, size, h);
 		p = hdr2ptr(h);
 	}
-	rcu_read_unlock();
+	update_stats_rcu_unlock(l);
 
 	if (ptr && p) {
 		struct alloc_hdr *old = ptr2hdr(ptr);
@@ -814,6 +834,17 @@ static const rb_data_type_t src_loc_type = {
 
 static VALUE cSrcLoc;
 
+static int
+extract_addr(const char *str, size_t len, void **p)
+{
+	const char *c;
+#if defined(__GLIBC__)
+	return ((c = memchr(str, '[', len)) && sscanf(c, "[%p]", p));
+#else /* tested FreeBSD */
+	return ((c = strstr(str, "0x")) && sscanf(c, "%p", p));
+#endif
+}
+
 /*
  * call-seq:
  *	Mwrap[location] -> Mwrap::SourceLocation
@@ -834,9 +865,8 @@ static VALUE mwrap_aref(VALUE mod, VALUE loc)
 	struct cds_lfht *t;
 	struct src_loc *l;
 	VALUE val = Qnil;
-	const char *c;
 
-	if ((c = memchr(str, '[', len)) && sscanf(c, "[%p]", (void **)&p)) {
+	if (extract_addr(str, len, (void **)&p)) {
 		k = (void *)kbuf;
 		memcpy(k->k, &p, sizeof(p));
 		k->capa = 0;
