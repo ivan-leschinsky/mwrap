@@ -155,4 +155,8 @@ class TestMwrap < Test::Unit::TestCase
     warn Benchmark::Tms::CAPTION
     warn r.read
   end if ENV['BENCHMARK']
+
+  def test_mwrap_dump_check
+    assert_raise(TypeError) { Mwrap.dump(:bogus) }
+  end
 end

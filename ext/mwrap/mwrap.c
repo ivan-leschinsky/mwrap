@@ -346,6 +346,7 @@ static VALUE mwrap_dump(int argc, VALUE * argv, VALUE mod)
 		io = *((VALUE *)dlsym(RTLD_DEFAULT, "rb_stderr"));
 
 	a.min = NIL_P(min) ? 0 : NUM2SIZET(min);
+	io = rb_io_get_io(io);
 	io = rb_io_get_write_io(io);
 	GetOpenFile(io, fptr);
 	a.fp = rb_io_stdio_file(fptr);
