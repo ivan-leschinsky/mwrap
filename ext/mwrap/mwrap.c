@@ -839,7 +839,7 @@ extract_addr(const char *str, size_t len, void **p)
 {
 	const char *c;
 #if defined(__GLIBC__)
-	return ((c = memchr(str, '[', len)) && sscanf(c, "[%p]", p));
+	return ((c = memrchr(str, '[', len)) && sscanf(c, "[%p]", p));
 #else /* tested FreeBSD */
 	return ((c = strstr(str, "0x")) && sscanf(c, "%p", p));
 #endif
