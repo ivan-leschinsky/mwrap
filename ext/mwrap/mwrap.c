@@ -61,6 +61,7 @@ static int resolving_malloc;
 	} \
 } while (0)
 
+static __thread size_t locating;
 static size_t generation;
 static size_t page_size;
 static struct cds_lfht *totals;
@@ -91,6 +92,7 @@ lfht_new(void)
 __attribute__((constructor)) static void resolve_malloc(void)
 {
 	int err;
+	++locating;
 
 #ifdef __FreeBSD__
 	/*
@@ -133,6 +135,7 @@ __attribute__((constructor)) static void resolve_malloc(void)
 	if (err)
 		fprintf(stderr, "pthread_atfork failed: %s\n", strerror(err));
 	page_size = sysconf(_SC_PAGESIZE);
+	--locating;
 }
 
 static void
@@ -161,8 +164,6 @@ my_mempcpy(void *dest, const void *src, size_t n)
 /* stolen from glibc: */
 #define RETURN_ADDRESS(nr) \
   (uintptr_t)(__builtin_extract_return_addr(__builtin_return_address(nr)))
-
-static __thread size_t locating;
 
 #define INT2STR_MAX (sizeof(int) == 4 ? 10 : 19)
 static char *int2str(int num, char *dst, size_t * size)
@@ -1013,7 +1014,10 @@ static VALUE src_loc_name(VALUE self)
  */
 void Init_mwrap(void)
 {
-	VALUE mod = rb_define_module("Mwrap");
+	VALUE mod;
+
+	++locating;
+        mod = rb_define_module("Mwrap");
 	id_uminus = rb_intern("-@");
 
 	cSrcLoc = rb_define_class_under(mod, "SourceLocation", rb_cObject);
@@ -1029,6 +1033,7 @@ void Init_mwrap(void)
 	rb_define_method(cSrcLoc, "mean_lifespan", src_loc_mean_lifespan, 0);
 	rb_define_method(cSrcLoc, "max_lifespan", src_loc_max_lifespan, 0);
 	rb_define_method(cSrcLoc, "name", src_loc_name, 0);
+	--locating;
 }
 
 /* rb_cloexec_open isn't usable by non-Ruby processes */
