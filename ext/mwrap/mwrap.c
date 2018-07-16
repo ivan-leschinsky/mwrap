@@ -23,6 +23,7 @@
 #include "jhash.h"
 
 static ID id_uminus;
+static unsigned int track_memalign;
 const char *rb_source_location_cstr(int *line); /* requires 2.6.0dev */
 extern int __attribute__((weak)) ruby_thread_has_gvl_p(void);
 extern void * __attribute__((weak)) ruby_current_execution_context_ptr;
@@ -92,6 +93,7 @@ lfht_new(void)
 __attribute__((constructor)) static void resolve_malloc(void)
 {
 	int err;
+	const char *opt;
 	++locating;
 
 #ifdef __FreeBSD__
@@ -135,6 +137,11 @@ __attribute__((constructor)) static void resolve_malloc(void)
 	if (err)
 		fprintf(stderr, "pthread_atfork failed: %s\n", strerror(err));
 	page_size = sysconf(_SC_PAGESIZE);
+	opt = getenv("MWRAP");
+	if (opt && (opt = strstr(opt, "memalign:"))) {
+		if (!sscanf(opt, "memalign:%u", &track_memalign))
+			fprintf(stderr, "not an unsigned int: %s\n", opt);
+	}
 	--locating;
 }
 
@@ -461,7 +468,7 @@ internal_memalign(void **pp, size_t alignment, size_t size, uintptr_t caller)
 		return ENOMEM;
 
 	/* assert(asize == (alignment + size + sizeof(struct alloc_hdr))); */
-	l = update_stats_rcu_lock(size, caller);
+	l = track_memalign ? update_stats_rcu_lock(size, caller) : 0;
 	real = real_malloc(asize);
 	if (real) {
 		void *p = hdr2ptr(real);
@@ -1008,9 +1015,16 @@ static VALUE src_loc_name(VALUE self)
  * * dump_fd: a writable FD to dump to
  * * dump_path: a path to dump to, the file is opened in O_APPEND mode
  * * dump_min: the minimum allocation size (total) to dump
+ * * memalign: use `1' to enable tracking the memalign family
  *
  * If both `dump_fd' and `dump_path' are specified, dump_path takes
  * precedence.
+ *
+ * Tracking the memalign family of functions is misleading for Ruby
+ * applications, as heap page allocations can happen anywhere a
+ * Ruby object is allocated, even in the coldest code paths.
+ * Furthermore, it is rarely-used outside of the Ruby object allocator.
+ * Thus tracking memalign functions is disabled by default.
  */
 void Init_mwrap(void)
 {
