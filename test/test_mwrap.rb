@@ -252,4 +252,24 @@ class TestMwrap < Test::Unit::TestCase
       loc.name.frozen? or abort 'SourceLocation#name not frozen'
     end;
   end
+
+  def test_quiet
+    assert_separately(+"#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      require 'mwrap'
+      before = __LINE__
+      res = Mwrap.quiet do |depth|
+        depth == 1 or abort 'depth is not 1'
+        ('a' * 10000).clear
+        Mwrap.quiet { |d| d == 2 or abort 'depth is not 2' }
+        :foo
+      end
+      after = __LINE__ - 1
+      (before..after).each do |lineno|
+        Mwrap["#{__FILE__}:#{lineno}"] and
+          abort "unexpectedly tracked allocation at line #{lineno}"
+      end
+      res == :foo or abort 'Mwrap.quiet did not return block result'
+    end;
+  end
 end

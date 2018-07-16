@@ -30,6 +30,7 @@ extern void * __attribute__((weak)) ruby_current_execution_context_ptr;
 extern void * __attribute__((weak)) ruby_current_vm_ptr; /* for rb_gc_count */
 extern size_t __attribute__((weak)) rb_gc_count(void);
 extern VALUE __attribute__((weak)) rb_cObject;
+extern VALUE __attribute__((weak)) rb_yield(VALUE);
 
 /* true for glibc/dlmalloc/ptmalloc, not sure about jemalloc */
 #define ASSUMED_MALLOC_ALIGNMENT (sizeof(void *) * 2)
@@ -997,6 +998,26 @@ static VALUE src_loc_name(VALUE self)
 	return ret;
 }
 
+static VALUE reset_locating(VALUE ign) { --locating; return Qfalse; }
+
+/*
+ * call-seq:
+ *
+ *	Mwrap.quiet do |depth|
+ *	  # expensive sort/calculate/emitting results of Mwrap.each
+ *	  # affecting statistics of the rest of the app
+ *	end
+ *
+ * Stops allocation tracking inside the block.  This is useful for
+ * monitoring code which calls other Mwrap (or ObjectSpace/GC)
+ * functions which unavoidably allocate memory.
+ */
+static VALUE mwrap_quiet(VALUE mod)
+{
+	size_t cur = ++locating;
+	return rb_ensure(rb_yield, SIZET2NUM(cur), reset_locating, 0);
+}
+
 /*
  * Document-module: Mwrap
  *
@@ -1040,6 +1061,7 @@ void Init_mwrap(void)
 	rb_define_singleton_method(mod, "clear", mwrap_clear, 0);
 	rb_define_singleton_method(mod, "each", mwrap_each, -1);
 	rb_define_singleton_method(mod, "[]", mwrap_aref, 1);
+	rb_define_singleton_method(mod, "quiet", mwrap_quiet, 0);
 	rb_define_method(cSrcLoc, "each", src_loc_each, 0);
 	rb_define_method(cSrcLoc, "frees", src_loc_frees, 0);
 	rb_define_method(cSrcLoc, "allocations", src_loc_allocations, 0);
