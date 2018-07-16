@@ -26,4 +26,11 @@ if ENV['MWRAP'] =~ /dump_fd:(\d+)/
     opts[dump_fd] = dump_io
   end
 end
+
+# allow inheriting FDs from systemd
+n = ENV['LISTEN_FDS']
+if n && ENV['LISTEN_PID'].to_i == $$
+  n = 3 + n.to_i
+  (3...n).each { |fd| opts[fd] = IO.new(fd) }
+end
 exec *ARGV, opts
