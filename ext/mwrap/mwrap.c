@@ -942,6 +942,8 @@ static struct src_loc *src_loc_get(VALUE self)
  * yielding the +size+ (in bytes) and +generation+ of each allocation.
  * The +generation+ is the value of the GC.count method at the time
  * the allocation was made.
+ *
+ * This functionality is only available in mwrap 2.0.0+
  */
 static VALUE src_loc_each(VALUE self)
 {
@@ -954,6 +956,10 @@ static VALUE src_loc_each(VALUE self)
 	return self;
 }
 
+/*
+ * The the mean lifespan (in GC generations) of allocations made from this
+ * location.  This does not account for live allocations.
+ */
 static VALUE src_loc_mean_lifespan(VALUE self)
 {
 	struct src_loc *l = src_loc_get(self);
@@ -964,21 +970,28 @@ static VALUE src_loc_mean_lifespan(VALUE self)
 	return DBL2NUM(frees ? ((double)tot/(double)frees) : HUGE_VAL);
 }
 
+/* The number of frees made from this location */
 static VALUE src_loc_frees(VALUE self)
 {
 	return SIZET2NUM(uatomic_read(&src_loc_get(self)->frees));
 }
 
+/* The number of allocations made from this location */
 static VALUE src_loc_allocations(VALUE self)
 {
 	return SIZET2NUM(uatomic_read(&src_loc_get(self)->allocations));
 }
 
+/* The total number of bytes allocated from this location */
 static VALUE src_loc_total(VALUE self)
 {
 	return SIZET2NUM(uatomic_read(&src_loc_get(self)->total));
 }
 
+/*
+ * The maximum age (in GC generations) of an allocation before it was freed.
+ * This does not account for live allocations.
+ */
 static VALUE src_loc_max_lifespan(VALUE self)
 {
 	return SIZET2NUM(uatomic_read(&src_loc_get(self)->max_lifespan));
@@ -1011,6 +1024,8 @@ static VALUE reset_locating(VALUE ign) { --locating; return Qfalse; }
  * Stops allocation tracking inside the block.  This is useful for
  * monitoring code which calls other Mwrap (or ObjectSpace/GC)
  * functions which unavoidably allocate memory.
+ *
+ * This feature was added in mwrap 2.0.0+
  */
 static VALUE mwrap_quiet(VALUE mod)
 {
@@ -1052,9 +1067,16 @@ void Init_mwrap(void)
 	VALUE mod;
 
 	++locating;
-        mod = rb_define_module("Mwrap");
+	mod = rb_define_module("Mwrap");
 	id_uminus = rb_intern("-@");
 
+	/*
+	 * Represents a location in source code or library
+	 * address which calls a memory allocation.  It is
+	 * updated automatically as allocations are made, so
+	 * there is no need to reload or reread it from Mwrap#[].
+	 * This class is only available since mwrap 2.0.0+.
+	 */
 	cSrcLoc = rb_define_class_under(mod, "SourceLocation", rb_cObject);
 	rb_define_singleton_method(mod, "dump", mwrap_dump, -1);
 	rb_define_singleton_method(mod, "reset", mwrap_reset, 0);
@@ -1080,18 +1102,18 @@ void Init_mwrap(void)
 __attribute__ ((destructor))
 static void mwrap_dump_destructor(void)
 {
-        const char *opt = getenv("MWRAP");
-        const char *modes[] = { "a", "a+", "w", "w+", "r+" };
-        struct dump_arg a;
-        size_t i;
-        int dump_fd;
+	const char *opt = getenv("MWRAP");
+	const char *modes[] = { "a", "a+", "w", "w+", "r+" };
+	struct dump_arg a;
+	size_t i;
+	int dump_fd;
 	char *dump_path;
 
 	if (!opt)
 		return;
 
-        ++locating;
-        if ((dump_path = strstr(opt, "dump_path:")) &&
+	++locating;
+	if ((dump_path = strstr(opt, "dump_path:")) &&
 			(dump_path += sizeof("dump_path")) &&
 			*dump_path) {
 		char *end = strchr(dump_path, ',');
@@ -1136,5 +1158,5 @@ static void mwrap_dump_destructor(void)
 	}
 	dump_to_file(&a);
 out:
-    --locating;
+	--locating;
 }

@@ -5,9 +5,24 @@ require 'mwrap'
 require 'rack'
 require 'cgi'
 
-# Usage: mwrap rackup ...
+# MwrapRack is a standalone Rack application which can be
+# mounted to run within your application process.
+#
+# Using the Rack::Builder API in config.ru, you can map it to
+# the "/MWRAP/" endpoint.  As with the rest of the Mwrap API,
+# your Rack server needs to be spawned with the mwrap(1)
+# wrapper to enable the LD_PRELOAD.
+#
+#     require 'mwrap_rack'
+#     map('/MWRAP') { run(MwrapRack.new) }
+#     map('/') { run(your_normal_app) }
+#
+# A live demo is available at https://80x24.org/MWRAP/
+# (warning the demo machine is 32-bit, so counters will overflow)
+#
+# This module is only available in mwrap 2.0.0+
 class MwrapRack
-  module HtmlResponse
+  module HtmlResponse # :nodoc:
     def response
       [ 200, {
           'Expires' => 'Fri, 01 Jan 1980 00:00:00 GMT',
@@ -18,7 +33,7 @@ class MwrapRack
     end
   end
 
-  class Each < Struct.new(:script_name, :min, :sort)
+  class Each < Struct.new(:script_name, :min, :sort) # :nodoc:
     include HtmlResponse
     HEADER = '<tr><th>' + %w(total allocations frees mean_life max_life
                 location).join('</th><th>') + '</th></tr>'
@@ -61,7 +76,7 @@ class MwrapRack
     end
   end
 
-  class EachAt < Struct.new(:loc)
+  class EachAt < Struct.new(:loc) # :nodoc:
     include HtmlResponse
     HEADER = '<tr><th>size</th><th>generation</th></tr>'
 
@@ -77,10 +92,11 @@ class MwrapRack
     end
   end
 
-  def r404
+  def r404 # :nodoc:
     [404,{'Content-Type'=>'text/plain'},["Not found\n"]]
   end
 
+  # The standard Rack application endpoint for MwrapRack
   def call(env)
     case env['PATH_INFO']
     when %r{\A/each/(\d+)\z}

@@ -4,20 +4,23 @@ mwrap is designed to answer the question:
 
    Which lines of Ruby are hitting malloc the most?
 
-mwrap wraps all malloc, calloc, and realloc calls to trace the Ruby
-source location of such calls and bytes allocated at each callsite.
-This functionality may be expanded in the future.
+mwrap wraps all malloc-family calls to trace the Ruby source
+location of such calls and bytes allocated at each callsite.
+As of mwrap 2.0.0, it can also function as a leak detector
+and show live allocations at every call site.  Depending on
+your application and workload, the overhead is roughly a 50%
+increase memory and runtime.
 
-It does not track allocation lifetimes, or frees, however.  It works
-best for allocations under GVL, but tries to track numeric caller
-addresses for allocations made without GVL so you can get an idea of how
-much memory usage certain extensions and native libraries use.
+It works best for allocations under GVL, but tries to track
+numeric caller addresses for allocations made without GVL so you
+can get an idea of how much memory usage certain extensions and
+native libraries use.
 
 It requires the concurrent lock-free hash table from the
 Userspace RCU project: https://liburcu.org/
 
-It does not require recompiling or rebuilding Ruby, but only supports
-Ruby trunk (2.6.0dev+) on a few platforms:
+It does not require recompiling or rebuilding Ruby, but only
+supports Ruby trunk (2.6.0dev+) on a few platforms:
 
 * GNU/Linux
 * FreeBSD (tested 11.1)
@@ -45,10 +48,12 @@ variable to append the results to a log file:
 	sort -k1,1rn </path/to/log | $PAGER
 
 You may also `require "mwrap"' in your Ruby code and use
-Mwrap.dump, Mwrap.clear, Mwrap.reset, Mwrap.each, etc.
+Mwrap.dump, Mwrap.reset, Mwrap.each, etc.
 
 However, mwrap MUST be loaded via LD_PRELOAD to have any
-effect in tracking malloc use.
+effect in tracking malloc use.  However, it is safe to keep
+"require 'mwrap'" in performance-critical deployments,
+as overhead is only incurred when used as an LD_PRELOAD.
 
 The output of the mwrap dump is a text file with 3 columns:
 
@@ -58,6 +63,11 @@ Where location is a Ruby source location (if made under GVL)
 or an address retrieved by backtrace_symbols(3).  It is
 recommended to use the sort(1) command on either of the
 first two columns to find the hottest malloc locations.
+
+mwrap 2.0.0+ also supports a Rack application endpoint,
+it is documented at:
+
+	https://80x24.org/mwrap/MwrapRack.html
 
 == Known problems
 
