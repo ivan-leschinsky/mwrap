@@ -8,5 +8,6 @@ bin/mwrap
 ext/mwrap/extconf.rb
 ext/mwrap/jhash.h
 ext/mwrap/mwrap.c
+lib/mwrap_rack.rb
 mwrap.gemspec
 test/test_mwrap.rb
