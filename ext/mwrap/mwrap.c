@@ -32,6 +32,8 @@ extern size_t __attribute__((weak)) rb_gc_count(void);
 extern VALUE __attribute__((weak)) rb_cObject;
 extern VALUE __attribute__((weak)) rb_yield(VALUE);
 
+static size_t total_bytes_inc, total_bytes_dec;
+
 /* true for glibc/dlmalloc/ptmalloc, not sure about jemalloc */
 #define ASSUMED_MALLOC_ALIGNMENT (sizeof(void *) * 2)
 
@@ -327,6 +329,8 @@ static struct src_loc *update_stats_rcu_lock(size_t size, uintptr_t caller)
 	if (caa_unlikely(!totals)) return 0;
 	if (locating++) goto out; /* do not recurse into another *alloc */
 
+	uatomic_add(&total_bytes_inc, size);
+
 	rcu_read_lock();
 	if (has_ec_p()) {
 		int line;
@@ -390,6 +394,7 @@ void free(void *p)
 		if (l) {
 			size_t age = generation - h->as.live.gen;
 
+			uatomic_add(&total_bytes_dec, h->size);
 			uatomic_set(&h->size, 0);
 			uatomic_add(&l->frees, 1);
 			uatomic_add(&l->age_total, age);
@@ -710,11 +715,15 @@ static VALUE mwrap_dump(int argc, VALUE * argv, VALUE mod)
 	return Qnil;
 }
 
+/* The whole operation is not remotely atomic... */
 static void *totals_reset(void *ign)
 {
 	struct cds_lfht *t;
 	struct cds_lfht_iter iter;
 	struct src_loc *l;
+
+	uatomic_set(&total_bytes_inc, 0);
+	uatomic_set(&total_bytes_dec, 0);
 
 	rcu_read_lock();
 	t = rcu_dereference(totals);
@@ -1033,6 +1042,16 @@ static VALUE mwrap_quiet(VALUE mod)
 	return rb_ensure(rb_yield, SIZET2NUM(cur), reset_locating, 0);
 }
 
+static VALUE total_inc(VALUE mod)
+{
+	return SIZET2NUM(total_bytes_inc);
+}
+
+static VALUE total_dec(VALUE mod)
+{
+	return SIZET2NUM(total_bytes_dec);
+}
+
 /*
  * Document-module: Mwrap
  *
@@ -1084,6 +1103,8 @@ void Init_mwrap(void)
 	rb_define_singleton_method(mod, "each", mwrap_each, -1);
 	rb_define_singleton_method(mod, "[]", mwrap_aref, 1);
 	rb_define_singleton_method(mod, "quiet", mwrap_quiet, 0);
+	rb_define_singleton_method(mod, "total_bytes_allocated", total_inc, 0);
+	rb_define_singleton_method(mod, "total_bytes_freed", total_dec, 0);
 	rb_define_method(cSrcLoc, "each", src_loc_each, 0);
 	rb_define_method(cSrcLoc, "frees", src_loc_frees, 0);
 	rb_define_method(cSrcLoc, "allocations", src_loc_allocations, 0);

@@ -272,4 +272,15 @@ class TestMwrap < Test::Unit::TestCase
       res == :foo or abort 'Mwrap.quiet did not return block result'
     end;
   end
+
+  def test_total_bytes
+    assert_separately(+"#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      require 'mwrap'
+      Mwrap.total_bytes_allocated > 0 or abort 'nothing allocated'
+      Mwrap.total_bytes_freed > 0 or abort 'nothing freed'
+      Mwrap.total_bytes_allocated > Mwrap.total_bytes_freed or
+        abort 'freed more than allocated'
+    end;
+  end
 end
