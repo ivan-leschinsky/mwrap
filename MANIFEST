@@ -1,5 +1,6 @@
 .document
 .gitignore
+.olddoc.yml
 COPYING
 MANIFEST
 README
