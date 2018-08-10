@@ -92,6 +92,53 @@ class MwrapRack
     end
   end
 
+  class HeapPages # :nodoc:
+    include HtmlResponse
+    HEADER = '<tr><th>address</th><th>generation</th></tr>'
+
+    def hpb_rows
+      Mwrap::HeapPageBody.stat(stat = Thread.current[:mwrap_hpb_stat] ||= {})
+      %i(lifespan_max lifespan_min lifespan_mean lifespan_stddev
+         deathspan_max deathspan_min deathspan_mean deathspan_stddev
+         resurrects
+        ).map! do |k|
+         "<tr><td>#{k}</td><td>#{stat[k]}</td></tr>\n"
+      end.join
+    end
+
+    def gc_stat_rows
+      GC.stat(stat = Thread.current[:mwrap_gc_stat] ||= {})
+      %i(count heap_allocated_pages heap_eden_pages heap_tomb_pages
+          total_allocated_pages total_freed_pages).map do |k|
+         "<tr><td>GC.stat(:#{k})</td><td>#{stat[k]}</td></tr>\n"
+      end.join
+    end
+
+    GC_STAT_URL = 'https://docs.ruby-lang.org/en/trunk/GC.html#method-c-stat'
+    GC_STAT_HELP = <<~""
+      <p>Non-Infinity lifespans can indicate fragmentation.
+      <p>See <a
+      href="#{GC_STAT_URL}">#{GC_STAT_URL}</a> for info on GC.stat values.
+
+    def each
+      Mwrap.quiet do
+        yield("<html><head><title>heap pages</title></head>" \
+              "<body><h1>heap pages</h1>" \
+              "<table><tr><th>stat</th><th>value</th></tr>\n" \
+              "#{hpb_rows}" \
+              "#{gc_stat_rows}" \
+              "</table>\n" \
+              "#{GC_STAT_HELP}" \
+              "<table>#{HEADER}")
+        Mwrap::HeapPageBody.each do |addr, generation|
+          addr = -sprintf('0x%x', addr)
+          yield(-"<tr><td>#{addr}</td><td>#{generation}</td></tr>\n")
+        end
+        yield "</table></body></html>\n"
+      end
+    end
+  end
+
   def r404 # :nodoc:
     [404,{'Content-Type'=>'text/plain'},["Not found\n"]]
   end
@@ -107,12 +154,16 @@ class MwrapRack
       loc = -CGI.unescape($1)
       loc = Mwrap[loc] or return r404
       EachAt.new(loc).response
+    when '/heap_pages'
+      HeapPages.new.response
     when '/'
       n = 2000
       u = 'https://80x24.org/mwrap/README.html'
       b = -('<html><head><title>Mwrap demo</title></head>' \
           "<body><p><a href=\"each/#{n}\">allocations &gt;#{n} bytes</a>" \
-          "<p><a href=\"#{u}\">#{u}</a></body></html>\n")
+          "<p><a href=\"#{u}\">#{u}</a>" \
+          "<p><a href=\"heap_pages\">heap pages</a>" \
+          "</body></html>\n")
       [ 200, {'Content-Type'=>'text/html','Content-Length'=>-b.size.to_s},[b]]
     else
       r404

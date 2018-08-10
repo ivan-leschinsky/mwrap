@@ -30,12 +30,23 @@ extern void * __attribute__((weak)) ruby_current_execution_context_ptr;
 extern void * __attribute__((weak)) ruby_current_vm_ptr; /* for rb_gc_count */
 extern size_t __attribute__((weak)) rb_gc_count(void);
 extern VALUE __attribute__((weak)) rb_cObject;
+extern VALUE __attribute__((weak)) rb_eTypeError;
 extern VALUE __attribute__((weak)) rb_yield(VALUE);
 
 static size_t total_bytes_inc, total_bytes_dec;
 
 /* true for glibc/dlmalloc/ptmalloc, not sure about jemalloc */
 #define ASSUMED_MALLOC_ALIGNMENT (sizeof(void *) * 2)
+
+/* match values in Ruby gc.c */
+#define HEAP_PAGE_ALIGN_LOG 14
+enum {
+	HEAP_PAGE_ALIGN = (1UL << HEAP_PAGE_ALIGN_LOG),
+	REQUIRED_SIZE_BY_MALLOC = (sizeof(size_t) * 5),
+	HEAP_PAGE_SIZE = (HEAP_PAGE_ALIGN - REQUIRED_SIZE_BY_MALLOC)
+};
+
+#define IS_HEAP_PAGE_BODY ((struct src_loc *)-1)
 
 int __attribute__((weak)) ruby_thread_has_gvl_p(void)
 {
@@ -213,6 +224,32 @@ static int has_ec_p(void)
 		ruby_current_execution_context_ptr);
 }
 
+struct acc {
+	size_t nr;
+	size_t min;
+	size_t max;
+	double m2;
+	double mean;
+};
+
+#define ACC_INIT(name) { .nr=0, .min=SIZE_MAX, .max=0, .m2=0, .mean=0 }
+
+/* for tracking 16K-aligned heap page bodies (protected by GVL) */
+struct {
+	pthread_mutex_t lock;
+	struct cds_list_head bodies;
+	struct cds_list_head freed;
+
+	struct acc alive;
+	struct acc reborn;
+} hpb_stats = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.bodies = CDS_LIST_HEAD_INIT(hpb_stats.bodies),
+	.freed = CDS_LIST_HEAD_INIT(hpb_stats.freed),
+	.alive = ACC_INIT(hpb_stats.alive),
+	.reborn = ACC_INIT(hpb_stats.reborn)
+};
+
 /* allocated via real_malloc/real_free */
 struct src_loc {
 	pthread_mutex_t *mtx;
@@ -237,6 +274,9 @@ struct alloc_hdr {
 			struct src_loc *loc;
 		} live;
 		struct rcu_head dead;
+		struct {
+			size_t at; /* rb_gc_count() */
+		} hpb_freed;
 	} as;
 	void *real; /* what to call real_free on */
 	size_t size;
@@ -274,6 +314,52 @@ static int loc_eq(struct cds_lfht_node *node, const void *key)
 	return (k->hval == existing->hval &&
 		k->capa == existing->capa &&
 		memcmp(k->k, existing->k, loc_size(k)) == 0);
+}
+
+/* note: not atomic */
+static void
+acc_add(struct acc *acc, size_t val)
+{
+	double delta = val - acc->mean;
+	size_t nr = ++acc->nr;
+
+	/* 32-bit overflow, ignore accuracy, just don't divide-by-zero */
+	if (nr)
+		acc->mean += delta / nr;
+
+	acc->m2 += delta * (val - acc->mean);
+	if (val < acc->min)
+		acc->min = val;
+	if (val > acc->max)
+		acc->max = val;
+}
+
+static VALUE
+acc_max(const struct acc *acc)
+{
+	return acc->max ? SIZET2NUM(acc->max) : DBL2NUM(HUGE_VAL);
+}
+
+static VALUE
+acc_min(const struct acc *acc)
+{
+	return acc->min == SIZE_MAX ? DBL2NUM(HUGE_VAL) : SIZET2NUM(acc->min);
+}
+
+static VALUE
+acc_mean(const struct acc *acc)
+{
+	return DBL2NUM(acc->nr ? acc->mean : HUGE_VAL);
+}
+
+static VALUE
+acc_stddev(const struct acc *acc)
+{
+	if (acc->nr > 1) {
+		double variance = acc->m2 / (acc->nr - 1);
+		DBL2NUM(sqrt(variance));
+	}
+	return INT2NUM(0);
 }
 
 static struct src_loc *totals_add_rcu(struct src_loc *k)
@@ -391,7 +477,7 @@ void free(void *p)
 		struct src_loc *l = h->as.live.loc;
 
 		if (!real_free) return; /* oh well, leak a little */
-		if (l) {
+		if (l && l != IS_HEAP_PAGE_BODY) {
 			size_t age = generation - h->as.live.gen;
 
 			uatomic_add(&total_bytes_dec, h->size);
@@ -406,8 +492,20 @@ void free(void *p)
 			mutex_unlock(l->mtx);
 
 			call_rcu(&h->as.dead, free_hdr_rcu);
-		}
-		else {
+		} else if (l == IS_HEAP_PAGE_BODY) {
+			size_t gen = generation;
+			size_t age = gen - h->as.live.gen;
+
+			h->as.hpb_freed.at = gen;
+
+			mutex_lock(&hpb_stats.lock);
+			acc_add(&hpb_stats.alive, age);
+
+			/* hpb_stats.bodies => hpb_stats.freed */
+			cds_list_move(&h->anode, &hpb_stats.freed);
+
+			mutex_unlock(&hpb_stats.lock);
+		} else {
 			real_free(h->real);
 		}
 	}
@@ -434,7 +532,7 @@ static size_t size_align(size_t size, size_t alignment)
 	return ((size + (alignment - 1)) & ~(alignment - 1));
 }
 
-static bool ptr_is_aligned(void *ptr, size_t alignment)
+static bool ptr_is_aligned(const void *ptr, size_t alignment)
 {
 	return ((uintptr_t)ptr & (alignment - 1)) == 0;
 }
@@ -473,18 +571,68 @@ internal_memalign(void **pp, size_t alignment, size_t size, uintptr_t caller)
 	    __builtin_add_overflow(asize, sizeof(struct alloc_hdr), &asize))
 		return ENOMEM;
 
-	/* assert(asize == (alignment + size + sizeof(struct alloc_hdr))); */
-	l = track_memalign ? update_stats_rcu_lock(size, caller) : 0;
-	real = real_malloc(asize);
-	if (real) {
-		void *p = hdr2ptr(real);
-		if (!ptr_is_aligned(p, alignment))
-			p = ptr_align(p, alignment);
-		h = ptr2hdr(p);
-		alloc_insert_rcu(l, h, size, real);
+
+	if (alignment == HEAP_PAGE_ALIGN && size == HEAP_PAGE_SIZE) {
+		if (has_ec_p()) generation = rb_gc_count();
+		l = IS_HEAP_PAGE_BODY;
+	} else if (track_memalign) {
+		l = update_stats_rcu_lock(size, caller);
+	} else {
+		l = 0;
+	}
+
+	if (l == IS_HEAP_PAGE_BODY) {
+		void *p;
+		size_t gen = generation;
+
+		mutex_lock(&hpb_stats.lock);
+
+		/* reuse existing entry */
+		if (!cds_list_empty(&hpb_stats.freed)) {
+			size_t deathspan;
+
+			h = cds_list_first_entry(&hpb_stats.freed,
+						 struct alloc_hdr, anode);
+			/* hpb_stats.freed => hpb_stats.bodies */
+			cds_list_move(&h->anode, &hpb_stats.bodies);
+			assert(h->size == size);
+			assert(h->real);
+			real = h->real;
+			p = hdr2ptr(h);
+			assert(ptr_is_aligned(p, alignment));
+
+			deathspan = gen - h->as.hpb_freed.at;
+			acc_add(&hpb_stats.reborn, deathspan);
+		}
+		else {
+			real = real_malloc(asize);
+			if (!real) return ENOMEM;
+
+			p = hdr2ptr(real);
+			if (!ptr_is_aligned(p, alignment))
+				p = ptr_align(p, alignment);
+			h = ptr2hdr(p);
+			h->size = size;
+			h->real = real;
+			cds_list_add(&h->anode, &hpb_stats.bodies);
+		}
+		mutex_unlock(&hpb_stats.lock);
+		h->as.live.loc = l;
+		h->as.live.gen = gen;
 		*pp = p;
 	}
-	update_stats_rcu_unlock(l);
+	else {
+		real = real_malloc(asize);
+		if (real) {
+			void *p = hdr2ptr(real);
+			if (!ptr_is_aligned(p, alignment))
+				p = ptr_align(p, alignment);
+			h = ptr2hdr(p);
+			alloc_insert_rcu(l, h, size, real);
+			update_stats_rcu_unlock(l);
+			*pp = p;
+		}
+	}
 
 	return real ? 0 : ENOMEM;
 }
@@ -1052,6 +1200,73 @@ static VALUE total_dec(VALUE mod)
 	return SIZET2NUM(total_bytes_dec);
 }
 
+static VALUE hpb_each_yield(VALUE ignore)
+{
+	struct alloc_hdr *h, *next;
+
+	cds_list_for_each_entry_safe(h, next, &hpb_stats.bodies, anode) {
+		VALUE v[2]; /* [ generation, address ] */
+		void *addr = hdr2ptr(h);
+		assert(ptr_is_aligned(addr, HEAP_PAGE_ALIGN));
+		v[0] = LONG2NUM((long)addr);
+		v[1] = SIZET2NUM(h->as.live.gen);
+		rb_yield_values2(2, v);
+	}
+	return Qnil;
+}
+
+/*
+ * call-seq:
+ *
+ *     Mwrap::HeapPageBody.each { |gen, addr| } -> Integer
+ *
+ * Yields the generation (GC.count) the heap page body was created
+ * and address of the heap page body as an Integer.  Returns the
+ * number of allocated pages as an Integer.  This return value should
+ * match the result of GC.stat(:heap_allocated_pages)
+ */
+static VALUE hpb_each(VALUE mod)
+{
+	++locating;
+	return rb_ensure(hpb_each_yield, Qfalse, reset_locating, 0);
+}
+
+/*
+ * call-seq:
+ *
+ *	Mwrap::HeapPageBody.stat -> Hash
+ *	Mwrap::HeapPageBody.stat(hash) -> hash
+ *
+ * The maximum lifespan of a heap page body in the Ruby VM.
+ * This may be Infinity if no heap page bodies were ever freed.
+ */
+static VALUE hpb_stat(int argc, VALUE *argv, VALUE hpb)
+{
+	VALUE h;
+
+	rb_scan_args(argc, argv, "01", &h);
+	if (NIL_P(h))
+		h = rb_hash_new();
+	else if (!RB_TYPE_P(h, T_HASH))
+		rb_raise(rb_eTypeError, "not a hash %+"PRIsVALUE, h);
+
+	++locating;
+#define S(x) ID2SYM(rb_intern(#x))
+	rb_hash_aset(h, S(lifespan_max), acc_max(&hpb_stats.alive));
+	rb_hash_aset(h, S(lifespan_min), acc_min(&hpb_stats.alive));
+	rb_hash_aset(h, S(lifespan_mean), acc_mean(&hpb_stats.alive));
+	rb_hash_aset(h, S(lifespan_stddev), acc_stddev(&hpb_stats.alive));
+	rb_hash_aset(h, S(deathspan_max), acc_max(&hpb_stats.reborn));
+	rb_hash_aset(h, S(deathspan_min), acc_min(&hpb_stats.reborn));
+	rb_hash_aset(h, S(deathspan_mean), acc_mean(&hpb_stats.reborn));
+	rb_hash_aset(h, S(deathspan_stddev), acc_stddev(&hpb_stats.reborn));
+	rb_hash_aset(h, S(resurrects), SIZET2NUM(hpb_stats.reborn.nr));
+#undef S
+	--locating;
+
+	return h;
+}
+
 /*
  * Document-module: Mwrap
  *
@@ -1083,7 +1298,7 @@ static VALUE total_dec(VALUE mod)
  */
 void Init_mwrap(void)
 {
-	VALUE mod;
+	VALUE mod, hpb;
 
 	++locating;
 	mod = rb_define_module("Mwrap");
@@ -1105,6 +1320,8 @@ void Init_mwrap(void)
 	rb_define_singleton_method(mod, "quiet", mwrap_quiet, 0);
 	rb_define_singleton_method(mod, "total_bytes_allocated", total_inc, 0);
 	rb_define_singleton_method(mod, "total_bytes_freed", total_dec, 0);
+
+
 	rb_define_method(cSrcLoc, "each", src_loc_each, 0);
 	rb_define_method(cSrcLoc, "frees", src_loc_frees, 0);
 	rb_define_method(cSrcLoc, "allocations", src_loc_allocations, 0);
@@ -1112,6 +1329,18 @@ void Init_mwrap(void)
 	rb_define_method(cSrcLoc, "mean_lifespan", src_loc_mean_lifespan, 0);
 	rb_define_method(cSrcLoc, "max_lifespan", src_loc_max_lifespan, 0);
 	rb_define_method(cSrcLoc, "name", src_loc_name, 0);
+
+	/*
+	 * Information about "struct heap_page_body" allocations from
+	 * Ruby gc.c.  This can be useful for tracking fragmentation
+	 * from posix_memalign(3) use in mainline Ruby:
+	 *
+	 *   https://sourceware.org/bugzilla/show_bug.cgi?id=14581
+	 */
+	hpb = rb_define_class_under(mod, "HeapPageBody", rb_cObject);
+	rb_define_singleton_method(hpb, "stat", hpb_stat, -1);
+	rb_define_singleton_method(hpb, "each", hpb_each, 0);
+
 	--locating;
 }
 

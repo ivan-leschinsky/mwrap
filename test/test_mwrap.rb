@@ -283,4 +283,33 @@ class TestMwrap < Test::Unit::TestCase
         abort 'freed more than allocated'
     end;
   end
+
+  def test_heap_page_body
+    assert_separately(+"#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      require 'mwrap'
+      require 'rubygems' # use up some memory
+      ap = GC.stat(:heap_allocated_pages)
+      h = {}
+      nr = 0
+      Mwrap::HeapPageBody.each do |addr, gen|
+        nr += 1
+        gen <= GC.count && gen >= 0 or abort "bad generation: #{gen}"
+        (0 == (addr & 16383)) or abort "addr not aligned: #{'%x' % addr}"
+      end
+      nr == ap or abort 'HeapPageBody.each missed page'
+      10.times { (1..20000).to_a.map(&:to_s) }
+      3.times { GC.start }
+      Mwrap::HeapPageBody.stat(h)
+      Integer === h[:lifespan_max] or abort 'lifespan_max not recorded'
+      Integer === h[:lifespan_min] or abort 'lifespan_min not recorded'
+      Float === h[:lifespan_mean] or abort 'lifespan_mean not recorded'
+      3.times { GC.start }
+      10.times { (1..20000).to_a.map(&:to_s) }
+      Mwrap::HeapPageBody.stat(h)
+      h[:deathspan_min] <= h[:deathspan_max] or
+        abort 'wrong min/max deathtime'
+      Float === h[:deathspan_mean] or abort 'deathspan_mean not recorded'
+    end;
+  end
 end
