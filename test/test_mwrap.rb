@@ -58,6 +58,13 @@ class TestMwrap < Test::Unit::TestCase
       res = system(env, *cmd)
       assert res, $?.inspect
       assert_match(/\b10001\s+1\s+-e:1$/, tmp.read)
+
+      tmp.rewind
+      tmp.truncate(0)
+      env['MWRAP'] = "dump_path:#{tmp.path},dump_heap:5"
+      res = system(env, *cmd)
+      assert res, $?.inspect
+      assert_match %r{lifespan_stddev}, tmp.read
     end
   end
 

@@ -345,14 +345,20 @@ acc_mean(const struct acc *acc)
 	return DBL2NUM(acc->nr ? acc->mean : HUGE_VAL);
 }
 
-static VALUE
-acc_stddev(const struct acc *acc)
+static double
+acc_stddev_dbl(const struct acc *acc)
 {
 	if (acc->nr > 1) {
 		double variance = acc->m2 / (acc->nr - 1);
-		DBL2NUM(sqrt(variance));
+		return sqrt(variance);
 	}
-	return INT2NUM(0);
+	return 0.0;
+}
+
+static VALUE
+acc_stddev(const struct acc *acc)
+{
+	return DBL2NUM(acc_stddev_dbl(acc));
 }
 
 static struct src_loc *totals_add_rcu(struct src_loc *k)
@@ -1276,9 +1282,15 @@ static VALUE hpb_stat(int argc, VALUE *argv, VALUE hpb)
  * * dump_fd: a writable FD to dump to
  * * dump_path: a path to dump to, the file is opened in O_APPEND mode
  * * dump_min: the minimum allocation size (total) to dump
+ * * dump_heap: mask of heap_page_body statistics to dump
  *
  * If both `dump_fd' and `dump_path' are specified, dump_path takes
  * precedence.
+ *
+ * dump_heap bitmask
+ * * 0x01 - summary stats (same info as HeapPageBody.stat)
+ * * 0x02 - all live heaps (similar to HeapPageBody.each)
+ * * 0x04 - skip non-heap_page_body-related output
  */
 void Init_mwrap(void)
 {
@@ -1328,6 +1340,44 @@ void Init_mwrap(void)
 	--locating;
 }
 
+enum {
+	DUMP_HPB_STATS = 0x1,
+	DUMP_HPB_EACH = 0x2,
+	DUMP_HPB_EXCL = 0x4,
+};
+
+static void dump_hpb(FILE *fp, unsigned flags)
+{
+	if (flags & DUMP_HPB_STATS) {
+		fprintf(fp,
+			"lifespan_max: %zu\n"
+			"lifespan_min: %zu\n"
+			"lifespan_mean: %0.3f\n"
+			"lifespan_stddev: %0.3f\n"
+			"deathspan_max: %zu\n"
+			"deathspan_min: %zu\n"
+			"deathspan_mean: %0.3f\n"
+			"deathspan_stddev: %0.3f\n",
+			hpb_stats.alive.max,
+			hpb_stats.alive.min,
+			hpb_stats.alive.mean,
+			acc_stddev_dbl(&hpb_stats.alive),
+			hpb_stats.reborn.max,
+			hpb_stats.reborn.min,
+			hpb_stats.reborn.mean,
+			acc_stddev_dbl(&hpb_stats.reborn));
+	}
+	if (flags & DUMP_HPB_EACH) {
+		struct alloc_hdr *h;
+
+		cds_list_for_each_entry(h, &hpb_stats.bodies, anode) {
+			void *addr = hdr2ptr(h);
+
+			fprintf(fp, "%p\t%zu\n", addr, h->as.live.gen);
+		}
+	}
+}
+
 /* rb_cloexec_open isn't usable by non-Ruby processes */
 #ifndef O_CLOEXEC
 #  define O_CLOEXEC 0
@@ -1338,10 +1388,12 @@ static void mwrap_dump_destructor(void)
 {
 	const char *opt = getenv("MWRAP");
 	const char *modes[] = { "a", "a+", "w", "w+", "r+" };
-	struct dump_arg a;
+	struct dump_arg a = { .min = 0 };
 	size_t i;
 	int dump_fd;
+	unsigned dump_heap = 0;
 	char *dump_path;
+	char *s;
 
 	if (!opt)
 		return;
@@ -1368,8 +1420,11 @@ static void mwrap_dump_destructor(void)
 	else if (!sscanf(opt, "dump_fd:%d", &dump_fd))
 		goto out;
 
-	if (!sscanf(opt, "dump_min:%zu", &a.min))
-		a.min = 0;
+	if ((s = strstr(opt, "dump_min:")))
+		sscanf(s, "dump_min:%zu", &a.min);
+
+	if ((s = strstr(opt, "dump_heap:")))
+		sscanf(s, "dump_heap:%u", &dump_heap);
 
 	switch (dump_fd) {
 	case 0: goto out;
@@ -1390,7 +1445,9 @@ static void mwrap_dump_destructor(void)
 		}
 		/* we'll leak some memory here, but this is a destructor */
 	}
-	dump_to_file(&a);
+	if ((dump_heap & DUMP_HPB_EXCL) == 0)
+		dump_to_file(&a);
+	dump_hpb(a.fp, dump_heap);
 out:
 	--locating;
 }
