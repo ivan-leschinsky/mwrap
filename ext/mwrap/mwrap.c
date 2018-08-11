@@ -1193,11 +1193,17 @@ static VALUE mwrap_quiet(VALUE mod)
 	return rb_ensure(rb_yield, SIZET2NUM(cur), reset_locating, 0);
 }
 
+/*
+ * total bytes allocated as tracked by mwrap
+ */
 static VALUE total_inc(VALUE mod)
 {
 	return SIZET2NUM(total_bytes_inc);
 }
 
+/*
+ * total bytes freed as tracked by mwrap
+ */
 static VALUE total_dec(VALUE mod)
 {
 	return SIZET2NUM(total_bytes_dec);
@@ -1338,6 +1344,10 @@ void Init_mwrap(void)
 	 * from posix_memalign(3) use in mainline Ruby:
 	 *
 	 *   https://sourceware.org/bugzilla/show_bug.cgi?id=14581
+	 *
+	 * These statistics are never reset by Mwrap.reset or
+	 * any other method.  They only make sense in the context
+	 * of an entire program lifetime.
 	 */
 	hpb = rb_define_class_under(mod, "HeapPageBody", rb_cObject);
 	rb_define_singleton_method(hpb, "stat", hpb_stat, -1);
