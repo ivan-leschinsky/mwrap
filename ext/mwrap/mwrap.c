@@ -1351,21 +1351,26 @@ static void dump_hpb(FILE *fp, unsigned flags)
 	if (flags & DUMP_HPB_STATS) {
 		fprintf(fp,
 			"lifespan_max: %zu\n"
-			"lifespan_min: %zu\n"
+			"lifespan_min:%s%zu\n"
 			"lifespan_mean: %0.3f\n"
 			"lifespan_stddev: %0.3f\n"
 			"deathspan_max: %zu\n"
-			"deathspan_min: %zu\n"
+			"deathspan_min:%s%zu\n"
 			"deathspan_mean: %0.3f\n"
-			"deathspan_stddev: %0.3f\n",
+			"deathspan_stddev: %0.3f\n"
+			"gc_count: %zu\n",
 			hpb_stats.alive.max,
+			hpb_stats.alive.min == SIZE_MAX ? " -" : " ",
 			hpb_stats.alive.min,
 			hpb_stats.alive.mean,
 			acc_stddev_dbl(&hpb_stats.alive),
 			hpb_stats.reborn.max,
+			hpb_stats.reborn.min == SIZE_MAX ? " -" : " ",
 			hpb_stats.reborn.min,
 			hpb_stats.reborn.mean,
-			acc_stddev_dbl(&hpb_stats.reborn));
+			acc_stddev_dbl(&hpb_stats.reborn),
+			/* n.b.: unsafe to call rb_gc_count() in destructor */
+			generation);
 	}
 	if (flags & DUMP_HPB_EACH) {
 		struct alloc_hdr *h;
