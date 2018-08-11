@@ -218,14 +218,14 @@ static int has_ec_p(void)
 }
 
 struct acc {
-	size_t nr;
-	size_t min;
-	size_t max;
+	uint64_t nr;
+	int64_t min;
+	int64_t max;
 	double m2;
 	double mean;
 };
 
-#define ACC_INIT(name) { .nr=0, .min=SIZE_MAX, .max=0, .m2=0, .mean=0 }
+#define ACC_INIT(name) { .nr=0, .min=INT64_MAX, .max=-1, .m2=0, .mean=0 }
 
 /* for tracking 16K-aligned heap page bodies (protected by GVL) */
 struct {
@@ -314,29 +314,35 @@ static void
 acc_add(struct acc *acc, size_t val)
 {
 	double delta = val - acc->mean;
-	size_t nr = ++acc->nr;
+	uint64_t nr = ++acc->nr;
 
-	/* 32-bit overflow, ignore accuracy, just don't divide-by-zero */
+	/* just don't divide-by-zero if we ever hit this (unlikely :P) */
 	if (nr)
 		acc->mean += delta / nr;
 
 	acc->m2 += delta * (val - acc->mean);
-	if (val < acc->min)
-		acc->min = val;
-	if (val > acc->max)
-		acc->max = val;
+	if ((int64_t)val < acc->min)
+		acc->min = (int64_t)val;
+	if ((int64_t)val > acc->max)
+		acc->max = (int64_t)val;
 }
+
+#if SIZEOF_LONG == 8
+# define INT64toNUM(x) LONG2NUM((long)x)
+#elif defined(HAVE_LONG_LONG) && SIZEOF_LONG_LONG == 8
+# define INT64toNUM(x) LL2NUM((LONG_LONG)x)
+#endif
 
 static VALUE
 acc_max(const struct acc *acc)
 {
-	return acc->max ? SIZET2NUM(acc->max) : DBL2NUM(HUGE_VAL);
+	return INT64toNUM(acc->max);
 }
 
 static VALUE
 acc_min(const struct acc *acc)
 {
-	return acc->min == SIZE_MAX ? DBL2NUM(HUGE_VAL) : SIZET2NUM(acc->min);
+	return acc->min == INT64_MAX ? INT2FIX(-1) : INT64toNUM(acc->min);
 }
 
 static VALUE
@@ -1350,22 +1356,22 @@ static void dump_hpb(FILE *fp, unsigned flags)
 {
 	if (flags & DUMP_HPB_STATS) {
 		fprintf(fp,
-			"lifespan_max: %zu\n"
-			"lifespan_min:%s%zu\n"
+			"lifespan_max: %"PRId64"\n"
+			"lifespan_min:%s%"PRId64"\n"
 			"lifespan_mean: %0.3f\n"
 			"lifespan_stddev: %0.3f\n"
-			"deathspan_max: %zu\n"
-			"deathspan_min:%s%zu\n"
+			"deathspan_max: %"PRId64"\n"
+			"deathspan_min:%s%"PRId64"\n"
 			"deathspan_mean: %0.3f\n"
 			"deathspan_stddev: %0.3f\n"
 			"gc_count: %zu\n",
 			hpb_stats.alive.max,
-			hpb_stats.alive.min == SIZE_MAX ? " -" : " ",
+			hpb_stats.alive.min == INT64_MAX ? " -" : " ",
 			hpb_stats.alive.min,
 			hpb_stats.alive.mean,
 			acc_stddev_dbl(&hpb_stats.alive),
 			hpb_stats.reborn.max,
-			hpb_stats.reborn.min == SIZE_MAX ? " -" : " ",
+			hpb_stats.reborn.min == INT64_MAX ? " -" : " ",
 			hpb_stats.reborn.min,
 			hpb_stats.reborn.mean,
 			acc_stddev_dbl(&hpb_stats.reborn),
