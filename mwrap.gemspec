@@ -12,7 +12,7 @@ desc = `git describe --abbrev=4 HEAD`.strip.tr('-', '.').delete_prefix('v')
 
 Gem::Specification.new do |s|
   s.name = 'mwrap'
-  s.version = desc.empty? ? '2.0.0' : desc
+  s.version = desc.empty? ? '2.1.0' : desc
   s.homepage = 'https://80x24.org/mwrap/'
   s.authors = ["Ruby hackers"]
   s.summary = 'LD_PRELOAD malloc wrapper for Ruby'
