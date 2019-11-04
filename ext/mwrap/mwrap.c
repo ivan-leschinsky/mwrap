@@ -21,6 +21,7 @@
 #include <urcu/rculfhash.h>
 #include <urcu/rculist.h>
 #include "jhash.h"
+#include <stdbool.h>
 
 static ID id_uminus;
 const char *rb_source_location_cstr(int *line); /* requires 2.6.0dev */
