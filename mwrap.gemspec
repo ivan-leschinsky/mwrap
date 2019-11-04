@@ -8,7 +8,7 @@ if git_manifest[0] && manifest != git_manifest
   system('git add MANIFEST')
 end
 
-desc = `git describe --abbrev=4 HEAD`.strip.tr('-', '.').delete_prefix('v')
+desc = `git describe --abbrev=4 HEAD`.strip.tr('-', '.').sub('v', '')
 
 Gem::Specification.new do |s|
   s.name = 'mwrap'
